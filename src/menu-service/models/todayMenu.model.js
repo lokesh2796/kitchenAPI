@@ -1,0 +1,20 @@
+const mongoose = require('mongoose');
+const Schema = mongoose.Schema;
+
+const TodayMenuSchema = new Schema({
+    userId: { type: Schema.Types.ObjectId, ref: 'Users', required: true },
+    menuItemId: { type: Schema.Types.ObjectId, ref: 'MenuItem', required: true },
+    menuName: { type: String }, // Snapshot of name for faster reads
+    maxQty: { type: Number, required: true },
+    soldQty: { type: Number, default: 0 },
+    balanceQty: { type: Number, default: 0 },
+    availFrom: { type: String }, // e.g., "10:00 AM"
+    availTo: { type: String },   // e.g., "10:00 PM"
+    menuDate: { type: Date, required: true }, // Only date, not time
+    basePrice: { type: Number, required: true },
+    dealPrice: { type: Number },
+}, {
+    timestamps: true
+});
+
+module.exports = mongoose.model('TodayMenu', TodayMenuSchema);

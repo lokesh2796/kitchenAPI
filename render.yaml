@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: homekitchen-api
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: NODE_ENV
+        value: production
+      - key: MONGO_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_VERIFY_SERVICE_SID
+        sync: false
+      - key: EMAIL_HOST
+        value: smtp.gmail.com
+      - key: EMAIL_PORT
+        value: 587
+      - key: EMAIL_USER
+        sync: false
+      - key: EMAIL_PASS
+        sync: false
+      - key: GOOGLE_MAPS_API_KEY
+        sync: false
+      - key: PUBNUB_PUBLISH_KEY
+        sync: false
+      - key: PUBNUB_SUBSCRIBE_KEY
+        sync: false
+      - key: PUBNUB_USER_ID
+        value: backend-service
