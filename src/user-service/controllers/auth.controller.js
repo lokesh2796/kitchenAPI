@@ -4,6 +4,7 @@ const UserProfile = require('../../models/userProfile.model');
 const { sendEmail, sendSmsNotification } = require('../../utils/notification.service');
 const { encrypt } = require('../../utils/encryption');
 const MESSAGES = require('../../constants/messages');
+const { computeStepCompletion } = require('../../utils/vendor-steps');
 
 // Generate random 6-digit OTP
 const generateOTP = () => {
@@ -46,11 +47,19 @@ exports.initiateRegistration = async (req, res) => {
         const otpCode = generateOTP();
         const otpDate = new Date();
 
+        // ALL signups create a regular buyer in the pending-OTP state. The
+        // `userType: VENDOR` request is treated as a *routing hint* — the
+        // frontend reads it back from the OTP response to decide whether to
+        // drop the new user into /mainstep right after verification. The
+        // actual vendor promotion (isVendor=true, activeRole='VENDOR')
+        // happens only when /vendor/step1 is saved. This way, a user who
+        // signs up "as a vendor" but skips step 1 still has a perfectly
+        // valid buyer account they can sign back into.
         const requestedRole = (req.body.userType || 'user').toUpperCase();
-        const isVendor = requestedRole === 'VENDOR';
+        const wantsVendor = requestedRole === 'VENDOR';
 
         if (!user) {
-            // Create new User Identity
+            // Create new User Identity — always as a buyer.
             user = new Users({
                 firstName: finalFirstname,
                 lastName: finalLastname,
@@ -62,9 +71,9 @@ exports.initiateRegistration = async (req, res) => {
                 otpSent: otpDate,
                 otpFirstSent: otpDate,
                 otpAttempts: 1,
-                status: isVendor ? 'p' : 'a', // Pending verification
-                isVendor: isVendor,
-                activeRole: isVendor ? 'VENDOR' : 'USER'
+                status: 'p',          // Pending OTP verification (set to 'a' in verifyOtp)
+                isVendor: false,
+                activeRole: 'USER'
             });
             await user.save();
 
@@ -83,15 +92,14 @@ exports.initiateRegistration = async (req, res) => {
             await userProfile.save();
 
         } else {
-            // Update existing pending user
+            // Update existing pending user — never re-stamp them as a vendor
+            // here. Vendor promotion is exclusively done by /vendor/step1.
             user.firstName = finalFirstname;
             user.lastName = finalLastname;
             user.password = encrypt(password);
             user.otp = otpCode;
             user.otpSent = otpDate;
             user.otpAttempts += 1;
-            user.isVendor = isVendor || user.isVendor;
-            user.activeRole = isVendor ? 'VENDOR' : user.activeRole;
             await user.save();
 
             // Ensure profile exists (idempotency)
@@ -148,6 +156,18 @@ exports.login = async (req, res) => {
             // NOTE: Do NOT auto-switch role based on x-role header during login.
             // Role switching should only happen via the explicit /users/switch-role endpoint.
 
+            // Anyone who is a vendor should land back in the vendor view on
+            // every fresh login, even if they were last viewing as USER. This
+            // matters because:
+            //   1) socket auto-join uses the JWT role to enter vendor-${id}
+            //   2) the mobile alert handler keys off `activerole === 'vendor'`
+            //   3) the orders page picks vendor vs user endpoint by activeRole
+            // If a vendor wants to see the buyer view they can still flip via
+            // /users/switch-role from inside the app.
+            if (user.isVendor) {
+                user.activeRole = 'VENDOR';
+            }
+
             // Update Login Stats
             user.lastSignedIn = new Date();
             await user.save();
@@ -169,18 +189,13 @@ exports.login = async (req, res) => {
             if (user.isVendor && userProfile) {
                 responseData.vendorProfile = userProfile.toObject();
 
-                const ack = userProfile.vendorAck || {};
-                responseData.vendorProfile.stepCompleted = {
-                    step1: !!userProfile.businessName,
-                    step2: !!ack.payment,
-                    step3: !!ack.cancellation,
-                    step4: !!ack.delivery,
-                    step5: !!ack.refund,
-                    step6: !!ack.terms
-                };
-
-                responseData.kitchenStatus = userProfile.vendorStatus === 'Active' ? 'OPEN' : 'OFFLINE';
-                responseData.isLive = userProfile.vendorStatus === 'Active';
+                const { steps, allCompleted: allStepsCompleted } = computeStepCompletion(userProfile);
+                responseData.vendorProfile.stepCompleted = steps;
+                responseData.stepCompleted = steps;
+                responseData.allStepsCompleted = allStepsCompleted;
+                responseData.kitchenOpen = userProfile.kitchenOpen || false;
+                responseData.kitchenStatus = !allStepsCompleted ? 'PENDING' : (userProfile.kitchenOpen ? 'OPEN' : 'CLOSED');
+                responseData.isLive = allStepsCompleted && userProfile.kitchenOpen;
             }
 
             responseData.needsOnboarding = user.isVendor && (!userProfile || !userProfile.businessName);
@@ -306,19 +321,31 @@ exports.verifyOtp = async (req, res) => {
         }
 
         const wasPending = user.status === 'p';
-        // user.status = 'a'; // REMOVED: User remains pending until Step 1
         user.otp = undefined; // Clear OTP
 
-        // Only set vendor role during INITIAL registration (pending users signing up as vendor).
-        // For returning users who log in via OTP, do NOT change their activeRole.
+        // Activate the account on first OTP verification. Previously this
+        // line was commented out and `status` only got flipped to 'a' inside
+        // updateStep1, which meant a user who signed up as a vendor and
+        // skipped step 1 was permanently locked out (login.controller checks
+        // status === 'a' before issuing a token).
         if (wasPending) {
-            const requestedRole = (req.body.userType || 'USER').toUpperCase();
-            if (requestedRole === 'VENDOR') {
-                user.isVendor = true;
-                user.activeRole = 'VENDOR';
-            } else {
-                user.activeRole = 'USER';
-            }
+            user.status = 'a';
+        }
+
+        // Vendor promotion is exclusively the job of /vendor/step1. Even
+        // when the signup payload requested userType:VENDOR, we never set
+        // isVendor here — the user becomes a regular buyer until they
+        // actually save step 1. The original `userType` request is echoed
+        // back in the response below as a routing hint so the frontend can
+        // optionally drop them straight into /mainstep.
+        const requestedRole = (req.body.userType || '').toUpperCase();
+        const wantsVendor = requestedRole === 'VENDOR';
+
+        if (!wasPending && user.isVendor) {
+            // Returning vendor — always restore the vendor view on re-login
+            // (mirrors the email/password login flow). They can still flip
+            // back to USER from inside the app via /users/switch-role.
+            user.activeRole = 'VENDOR';
         }
 
         await user.save();
@@ -348,23 +375,25 @@ exports.verifyOtp = async (req, res) => {
         };
 
         if (user.isVendor && userProfile) {
-            // Calculate Vendor Completeness
-            const ack = userProfile.vendorAck || {};
             responseData.vendorProfile = userProfile.toObject();
-            responseData.vendorProfile.stepCompleted = {
-                step1: !!userProfile.businessName,
-                step2: !!ack.payment,
-                step3: !!ack.cancellation,
-                step4: !!ack.delivery,
-                step5: !!ack.refund,
-                step6: !!ack.terms
-            };
 
-            responseData.kitchenStatus = userProfile.vendorStatus === 'Active' ? 'OPEN' : 'OFFLINE';
-            responseData.isLive = userProfile.vendorStatus === 'Active';
+            const { steps, allCompleted: allStepsCompleted } = computeStepCompletion(userProfile);
+            responseData.vendorProfile.stepCompleted = steps;
+            responseData.stepCompleted = steps;
+            responseData.allStepsCompleted = allStepsCompleted;
+            responseData.kitchenOpen = userProfile.kitchenOpen || false;
+            responseData.kitchenStatus = !allStepsCompleted ? 'PENDING' : (userProfile.kitchenOpen ? 'OPEN' : 'CLOSED');
+            responseData.isLive = allStepsCompleted && userProfile.kitchenOpen;
         }
 
         responseData.needsOnboarding = user.isVendor && (!userProfile || !userProfile.businessName);
+        // Routing hint for the frontend: if this OTP verify is the tail end
+        // of a `userType: VENDOR` signup AND the user isn't yet a vendor,
+        // the signin / OTP screen should drop them into /mainstep so they
+        // can complete step 1. If they back out of step 1 they remain a
+        // perfectly valid buyer (status='a', isVendor=false) who can sign
+        // back in normally.
+        responseData.wantsVendor = wantsVendor && !user.isVendor;
 
         res.status(200).json({
             success: true,
@@ -398,6 +427,16 @@ exports.validateToken = async (req, res) => {
             return res.status(404).json({ success: false, message: MESSAGES.ERROR.USER_NOT_FOUND });
         }
 
+        // Self-heal ONLY when activeRole is missing entirely (legacy data).
+        // Do NOT override an explicit USER selection — within the same
+        // session, users who switched to USER mode must stay in USER mode.
+        // The fresh-login endpoints (login + verifyOtp) are responsible for
+        // resetting vendors back to VENDOR view at re-login time.
+        if (user.isVendor && !user.activeRole) {
+            user.activeRole = 'VENDOR';
+            await user.save();
+        }
+
         const userProfile = await UserProfile.findOne({ userId: user._id });
 
         const responseData = {
@@ -411,21 +450,16 @@ exports.validateToken = async (req, res) => {
         };
 
         if (user.isVendor && userProfile) {
-            responseData.vendorProfile = userProfile.toObject(); // Convert to object to add properties
+            responseData.vendorProfile = userProfile.toObject();
 
-            const ack = userProfile.vendorAck || {};
-            responseData.vendorProfile.stepCompleted = {
-                step1: !!userProfile.businessName,
-                step2: !!ack.payment,
-                step3: !!ack.cancellation,
-                step4: !!ack.delivery,
-                step5: !!ack.refund,
-                step6: !!ack.terms
-            };
-
-            responseData.kitchenStatus = userProfile.vendorStatus === 'Active' ? 'OPEN' : 'OFFLINE';
-            responseData.isLive = userProfile.vendorStatus === 'Active';
-            responseData.vendorDataCompleted = userProfile.vendorStatus === 'Active';
+            const { steps, allCompleted: allStepsCompleted } = computeStepCompletion(userProfile);
+            responseData.vendorProfile.stepCompleted = steps;
+            responseData.stepCompleted = steps;
+            responseData.allStepsCompleted = allStepsCompleted;
+            responseData.kitchenOpen = userProfile.kitchenOpen || false;
+            responseData.kitchenStatus = !allStepsCompleted ? 'PENDING' : (userProfile.kitchenOpen ? 'OPEN' : 'CLOSED');
+            responseData.isLive = allStepsCompleted && userProfile.kitchenOpen;
+            responseData.vendorDataCompleted = allStepsCompleted;
         }
 
         responseData.needsOnboarding = user.isVendor && (!userProfile || !userProfile.businessName);

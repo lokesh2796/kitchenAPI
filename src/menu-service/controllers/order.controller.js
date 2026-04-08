@@ -4,6 +4,7 @@ const Users = require('../../models/users.model');
 const Cart = require('../../order-service/models/cart.model');
 const { calculateDistance, generateOrderId, generateOTP } = require('../../utils/order-utils');
 const { publishEvent, CHANNELS, EVENTS } = require('../../utils/socket');
+const { computeCharges } = require('../../utils/order-charges');
 
 // ── IST Date Helpers ──────────────────────────────
 const getISTDateStr = (date) => {
@@ -48,24 +49,27 @@ exports.placeOrder = async (req, res) => {
 
         const finalPreferredTime = preferredTime || req.body.estimatedPickupTime || (deliveryDateStr === todayStr ? 'ASAP' : '');
 
-        // ── Calculate totals ────────────────────────────────────────────────
-        let subtotal = 0;
+        // ── Calculate totals via the shared charge helper ───────────────────
+        // Per-line itemTotal is still attached for backwards-compat with the
+        // existing order schema (orderItemSchema reads itemTotal).
         const processedItems = items.map((item) => {
             const price = item.dealPrice || item.basePrice;
             const addonsTotal = (item.selectedAddons || []).reduce((s, a) => s + (a.price || 0), 0);
-            const itemTotal = (price + addonsTotal) * item.qty;
-            subtotal += itemTotal;
-            return { ...item, itemTotal };
+            return { ...item, itemTotal: (price + addonsTotal) * item.qty };
         });
 
-        let deliveryCharge = 0;
         let deliveryAddress = null;
-
-        // ── Delivery Charge (only for delivery) ─────────────────────────────
+        let vendorDeliveryCharge = 0;
         if (orderType === 'delivery') {
             const vendorProfile = await UserProfile.findOne({ userId: vendorId });
-            deliveryCharge = vendorProfile?.deliveryPolicy?.deliveryCharge || 0;
+            vendorDeliveryCharge = vendorProfile?.deliveryPolicy?.deliveryCharge || 0;
         }
+
+        const charges = computeCharges(items, {
+            orderType,
+            deliveryCharge: vendorDeliveryCharge
+        });
+        const { itemTotal, discount, deliveryCharge, platformCharge, taxAmount, subtotal, grandTotal } = charges;
 
         // ── Resolve Delivery Address ──
         const userProfile = await UserProfile.findOne({ userId });
@@ -85,8 +89,8 @@ exports.placeOrder = async (req, res) => {
             return res.status(400).json({ message: 'Please select a delivery address or add one to your profile' });
         }
 
-        const totalAmount = subtotal + deliveryCharge;
-        console.log('Totals:', { subtotal, deliveryCharge, totalAmount });
+        const totalAmount = grandTotal;
+        console.log('Totals:', { itemTotal, discount, subtotal, deliveryCharge, platformCharge, taxAmount, totalAmount });
 
         // ── Resolve vendorName ──────────────────────────────────────────────
         let finalVendorName = vendorName;
@@ -245,7 +249,8 @@ exports.placeOrder = async (req, res) => {
         const order = new Order({
             userId, vendorId, vendorName: finalVendorName,
             items: processedItems,
-            subtotal, deliveryCharge, totalAmount,
+            itemTotal, discount, subtotal,
+            deliveryCharge, platformCharge, taxAmount, totalAmount,
             orderType: orderType || 'pickup',
             deliveryAddress, vendorAddress,
             paymentMethod: paymentMethod || 'COD',

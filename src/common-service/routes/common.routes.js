@@ -74,4 +74,53 @@ router.post('/location', commonController.findLocation);
  */
 router.post('/upload', uploadMiddleware.single('file'), uploadController.uploadFile);
 
+// ──────────────────────────────────────────────────────────────
+// LOOKUP ROUTES — serves all status/enum/lookup values from DB
+// ──────────────────────────────────────────────────────────────
+const lookupController = require('../controllers/lookup.controller');
+
+/**
+ * @swagger
+ * /common/lookup:
+ *   get:
+ *     summary: Get all lookup values grouped by category
+ *     tags: [Common]
+ *     parameters:
+ *       - in: query
+ *         name: category
+ *         schema: { type: string }
+ *         description: Filter by single category (e.g. order_status)
+ *       - in: query
+ *         name: flat
+ *         schema: { type: boolean }
+ *         description: Return as flat array instead of grouped
+ *     responses:
+ *       200:
+ *         description: Lookup values returned
+ */
+router.get('/lookup', lookupController.getAllLookups);
+
+/**
+ * @swagger
+ * /common/lookup/categories/list:
+ *   get:
+ *     summary: Get list of all distinct lookup categories
+ *     tags: [Common]
+ */
+router.get('/lookup/categories/list', lookupController.getCategories);
+
+/**
+ * @swagger
+ * /common/lookup/{category}:
+ *   get:
+ *     summary: Get all lookup values for a specific category
+ *     tags: [Common]
+ *     parameters:
+ *       - in: path
+ *         name: category
+ *         required: true
+ *         schema: { type: string }
+ */
+router.get('/lookup/:category', lookupController.getLookupByCategory);
+
 module.exports = router;

@@ -1,7 +1,9 @@
+const jwt = require('jsonwebtoken');
 const UserProfile = require('../../models/userProfile.model');
 const Users = require('../../models/users.model');
 const MESSAGES = require('../../constants/messages');
 const { sendEmail } = require('../../utils/notification.service');
+const { computeStepCompletion } = require('../../utils/vendor-steps');
 
 // Helper to get profile
 const getProfileByUserId = async (userId) => {
@@ -59,32 +61,60 @@ exports.updateStep1 = async (req, res) => {
             { new: true, upsert: true } // Create if doesn't exist (though it should)
         );
 
-        // ACTIVATE USER ACCOUNT and UPDATE PERSONAL INFO
+        // ────────────────────────────────────────────────────────────────
+        // PROMOTION POINT: this is where a buyer-only user actually
+        // becomes a vendor. switchRole no longer touches isVendor — it
+        // only kicks the user into the stepper. If they fill out and
+        // SAVE step 1, that commitment is what flips them to VENDOR. If
+        // they back out before saving, this code never runs and they
+        // remain a buyer with zero side effects.
+        // ────────────────────────────────────────────────────────────────
         const userUpdateData = {
-            status: 'a'
+            status: 'a',
+            isVendor: true,
+            activeRole: 'VENDOR'
         };
         if (req.body.firstName) userUpdateData.firstName = req.body.firstName;
         if (req.body.lastName) userUpdateData.lastName = req.body.lastName;
         if (req.body.email) userUpdateData.email = req.body.email;
         if (req.body.mobileNumber) userUpdateData.phone = req.body.mobileNumber;
 
-        await Users.findByIdAndUpdate(req.user.id, userUpdateData);
+        const updatedUser = await Users.findByIdAndUpdate(
+            req.user.id,
+            userUpdateData,
+            { new: true }
+        );
+
+        // Issue a fresh JWT carrying role:VENDOR. The Socket.IO handshake
+        // middleware reads this on (re)connection to auto-join the
+        // `vendor-${id}` private room. The frontend will save this token
+        // and call socketService.reconnectWithToken() so the new vendor
+        // immediately starts receiving NEW_ORDER events.
+        const newToken = jwt.sign(
+            { id: updatedUser._id, role: updatedUser.activeRole },
+            process.env.JWT_SECRET || 'default_jwt_secret_key_change_me',
+            { expiresIn: '30d' }
+        );
 
         // Send Partner Signup Email (with Kitchen Name)
         try {
-            const user = await Users.findById(req.user.id);
-            if (user && user.email) {
+            if (updatedUser && updatedUser.email) {
                 const templateData = {
-                    firstname: user.firstName || 'Partner',
+                    firstname: updatedUser.firstName || 'Partner',
                     kitchenName: businessName || 'Your Kitchen'
                 };
-                sendEmail(user.email, 'PARTNER_SIGNUP_CREATED', templateData).catch(err => console.error('Step 1 Email Error:', err));
+                sendEmail(updatedUser.email, 'PARTNER_SIGNUP_CREATED', templateData).catch(err => console.error('Step 1 Email Error:', err));
             }
         } catch (emailErr) {
             console.error('Failed to send Partner Email:', emailErr);
         }
 
-        res.status(200).json({ success: true, message: 'Step 1 Updated', data: profile });
+        res.status(200).json({
+            success: true,
+            message: 'Step 1 Updated',
+            token: newToken,
+            data: profile
+        });
     } catch (error) {
         console.error('Step 1 Error:', error);
         res.status(500).json({ success: false, message: error.message });
@@ -241,14 +271,10 @@ exports.updateStep5 = async (req, res) => {
  */
 exports.updateStep6 = async (req, res) => {
     try {
-        // Assuming Step 6 is essentially final confirmation similar to Step 5 or just a "Complete" signal
         const { termsAccepted } = req.body;
 
-        // If terms accepted, we might mark vendor as Active
         const updateData = {
-            'vendorAck.terms': true, // Reinforce terms
-            vendorStatus: 'Active',   // Activate Vendor
-            // vendorCloseDate could be managed here if needed
+            'vendorAck.terms': true,
             'stepCompleted.step6': true
         };
 
@@ -258,12 +284,121 @@ exports.updateStep6 = async (req, res) => {
             { new: true }
         );
 
-        // Also update the User identity status if needed
+        // Check if ALL 6 steps are completed — only then activate vendor
+        const { allCompleted: allStepsCompleted } = computeStepCompletion(profile);
+
+        if (allStepsCompleted) {
+            profile.vendorStatus = 'Active';
+            profile.kitchenOpen = true; // Auto-open kitchen when all steps done
+            await profile.save();
+        }
+
         await Users.findByIdAndUpdate(req.user.id, { isVendor: true });
 
-        res.status(200).json({ success: true, message: 'Vendor Profile Completed & Activated', data: profile });
+        res.status(200).json({
+            success: true,
+            message: allStepsCompleted ? 'Vendor Profile Completed & Kitchen is Live!' : 'Step 6 Updated. Complete remaining steps to go live.',
+            data: profile,
+            allStepsCompleted,
+            kitchenOpen: profile.kitchenOpen
+        });
     } catch (error) {
         console.error('Step 6 Error:', error);
         res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+/**
+ * Toggle Kitchen Open/Close
+ * Only allowed when vendorStatus is 'Active' (all steps completed)
+ */
+exports.toggleKitchen = async (req, res) => {
+    try {
+        const profile = await getProfileByUserId(req.user.id);
+        if (!profile) {
+            return res.status(404).json({ success: false, message: MESSAGES.ERROR.USER_NOT_FOUND });
+        }
+
+        // Compute completeness via the shared helper. This is the single source
+        // of truth for "is this vendor done with onboarding?" — readers never
+        // touch profile.stepCompleted.stepN directly anymore.
+        const { steps: effectiveSteps, allCompleted } = computeStepCompletion(profile);
+
+        if (!allCompleted) {
+            return res.status(400).json({
+                success: false,
+                message: 'Complete all onboarding steps before toggling kitchen status.',
+                stepCompleted: effectiveSteps
+            });
+        }
+
+        // Self-heal: backfill any missing stepCompleted flags and activate
+        // the vendor so the DB matches what the helper already considers true.
+        const dbSteps = profile.stepCompleted || {};
+        let mutated = false;
+        for (const k of ['step1', 'step2', 'step3', 'step4', 'step5', 'step6']) {
+            if (!dbSteps[k] && effectiveSteps[k]) {
+                profile.stepCompleted = profile.stepCompleted || {};
+                profile.stepCompleted[k] = true;
+                mutated = true;
+            }
+        }
+        if (profile.vendorStatus !== 'Active') {
+            profile.vendorStatus = 'Active';
+            mutated = true;
+        }
+
+        // Toggle kitchen open/close
+        profile.kitchenOpen = !profile.kitchenOpen;
+        if (!profile.kitchenOpen) {
+            profile.vendorCloseDate = new Date();
+        } else {
+            profile.vendorCloseDate = null;
+        }
+        // Mark nested paths as modified so Mongoose persists them.
+        if (mutated) profile.markModified('stepCompleted');
+        await profile.save();
+
+        res.status(200).json({
+            success: true,
+            message: profile.kitchenOpen ? 'Kitchen is now OPEN' : 'Kitchen is now CLOSED',
+            data: {
+                kitchenOpen: profile.kitchenOpen,
+                vendorStatus: profile.vendorStatus
+            }
+        });
+    } catch (error) {
+        console.error('Toggle Kitchen Error:', error);
+        res.status(500).json({ success: false, message: MESSAGES.ERROR.INTERNAL_SERVER_ERROR });
+    }
+};
+
+/**
+ * Get Vendor Onboarding Progress
+ */
+exports.getOnboardingProgress = async (req, res) => {
+    try {
+        const profile = await getProfileByUserId(req.user.id);
+        if (!profile) {
+            return res.status(404).json({ success: false, message: MESSAGES.ERROR.USER_NOT_FOUND });
+        }
+
+        const { steps, allCompleted: allStepsCompleted, completedCount } = computeStepCompletion(profile);
+
+        res.status(200).json({
+            success: true,
+            data: {
+                stepCompleted: steps,
+                allStepsCompleted,
+                completedCount,
+                totalSteps: 6,
+                vendorStatus: profile.vendorStatus,
+                kitchenOpen: profile.kitchenOpen,
+                needsOnboarding: !steps.step1
+            }
+        });
+    } catch (error) {
+        console.error('Get Progress Error:', error);
+        res.status(500).json({ success: false, message: MESSAGES.ERROR.INTERNAL_SERVER_ERROR });
     }
 };

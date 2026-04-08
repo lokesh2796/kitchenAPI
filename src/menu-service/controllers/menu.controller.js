@@ -408,8 +408,11 @@ exports.getExploreMenu = async (req, res) => {
         let tomorrowItems = [];
         let preorderItems = [];
 
-        // Helper to fetch menu items for a specific date/filter
-        const fetchMenuForDate = async (startDate, endDate) => {
+        // Helper to fetch menu items for a specific date/filter.
+        // `requireKitchenOpen` is true ONLY for today's items — tomorrow and
+        // preorder items remain visible even when the vendor's kitchen is
+        // currently closed, because those are future orders.
+        const fetchMenuForDate = async (startDate, endDate, requireKitchenOpen = true) => {
             const filter = {
                 menuDate: { $gte: startDate, $lte: endDate },
                 balanceQty: { $gt: 0 }
@@ -426,8 +429,8 @@ exports.getExploreMenu = async (req, res) => {
                 }).lean();
 
             const userIds = rawItems.map(i => i.userId._id);
-            // Fetch Profile for business name, vendor location, delivery policy
-            const profiles = await UserProfile.find({ userId: { $in: userIds } }).select('userId businessName vendorLocation deliveryPolicy');
+            // Fetch Profile for business name, vendor location, delivery policy, kitchen status
+            const profiles = await UserProfile.find({ userId: { $in: userIds } }).select('userId businessName vendorLocation deliveryPolicy vendorStatus kitchenOpen');
 
             const profileMap = {};
             profiles.forEach(p => {
@@ -439,18 +442,33 @@ exports.getExploreMenu = async (req, res) => {
                     name: p.businessName,
                     addr: addr,
                     deliveryPolicy: p.deliveryPolicy,
-                    vendorLocation: p.vendorLocation
+                    vendorLocation: p.vendorLocation,
+                    vendorStatus: p.vendorStatus,
+                    kitchenOpen: p.kitchenOpen
                 };
             });
 
-            return rawItems.map(item => {
+            // Filter: vendor must be Active. Kitchen-open is only enforced for today.
+            const filtered = rawItems.filter(item => {
+                const profile = profileMap[item.userId._id.toString()];
+                if (!profile || profile.vendorStatus !== 'Active') return false;
+                if (requireKitchenOpen && profile.kitchenOpen !== true) return false;
+                return true;
+            });
+
+            if (rawItems.length > filtered.length) {
+                console.log(`[explore] dropped ${rawItems.length - filtered.length}/${rawItems.length} items (vendor inactive${requireKitchenOpen ? ' or kitchen closed' : ''})`);
+            }
+
+            return filtered.map(item => {
                 const profile = profileMap[item.userId._id.toString()] || {};
                 return {
                     ...item,
                     vendorName: profile.name || (item.userId.firstName + "'s Kitchen"),
                     vendorAddress: profile.addr || 'Location not available',
                     deliveryPolicy: profile.deliveryPolicy,
-                    vendorLocation: profile.vendorLocation
+                    vendorLocation: profile.vendorLocation,
+                    kitchenOpen: profile.kitchenOpen
                 };
             });
         };
@@ -461,9 +479,11 @@ exports.getExploreMenu = async (req, res) => {
             const endOfToday = new Date(startOfToday);
             endOfToday.setUTCHours(23, 59, 59, 999);
 
-            todayItems = (await fetchMenuForDate(startOfToday, endOfToday)).map(i => ({ ...i, menuTag: 'today' }));
+            // Today: requires kitchen to be currently open.
+            todayItems = (await fetchMenuForDate(startOfToday, endOfToday, true))
+                .map(i => ({ ...i, menuTag: 'today' }));
 
-            // Fetch Tomorrow's Items
+            // Fetch Tomorrow's Items — visible regardless of kitchen-open today.
             const startOfTomorrow = new Date(startOfToday);
             startOfTomorrow.setDate(startOfTomorrow.getDate() + 1);
             startOfTomorrow.setUTCHours(0, 0, 0, 0);
@@ -471,7 +491,8 @@ exports.getExploreMenu = async (req, res) => {
             const endOfTomorrow = new Date(startOfTomorrow);
             endOfTomorrow.setUTCHours(23, 59, 59, 999);
 
-            tomorrowItems = (await fetchMenuForDate(startOfTomorrow, endOfTomorrow)).map(i => ({ ...i, menuTag: 'tomorrow' }));
+            tomorrowItems = (await fetchMenuForDate(startOfTomorrow, endOfTomorrow, false))
+                .map(i => ({ ...i, menuTag: 'tomorrow' }));
         }
 
         if (type === 'preorder' || type === 'all') {
@@ -486,8 +507,8 @@ exports.getExploreMenu = async (req, res) => {
                 }).lean();
 
             const userIds = rawItems.map(i => i.userId._id);
-            // Fetch Profile for business name, vendor location, delivery policy
-            const profiles = await UserProfile.find({ userId: { $in: userIds } }).select('userId businessName vendorLocation deliveryPolicy');
+            // Fetch Profile for business name, vendor location, delivery policy, kitchen status
+            const profiles = await UserProfile.find({ userId: { $in: userIds } }).select('userId businessName vendorLocation deliveryPolicy vendorStatus kitchenOpen');
 
             const profileMap = {};
             profiles.forEach(p => {
@@ -499,11 +520,24 @@ exports.getExploreMenu = async (req, res) => {
                     name: p.businessName,
                     addr: addr,
                     deliveryPolicy: p.deliveryPolicy,
-                    vendorLocation: p.vendorLocation
+                    vendorLocation: p.vendorLocation,
+                    vendorStatus: p.vendorStatus,
+                    kitchenOpen: p.kitchenOpen
                 };
             });
 
-            preorderItems = rawItems.map(item => {
+            // Preorders are future orders — visible whenever the vendor is
+            // Active, even if their kitchen is currently closed for today.
+            const filteredPre = rawItems.filter(item => {
+                const profile = profileMap[item.userId._id.toString()];
+                return profile && profile.vendorStatus === 'Active';
+            });
+
+            if (rawItems.length > filteredPre.length) {
+                console.log(`[explore] dropped ${rawItems.length - filteredPre.length}/${rawItems.length} preorder items (vendor inactive)`);
+            }
+
+            preorderItems = filteredPre.map(item => {
                 const profile = profileMap[item.userId._id.toString()] || {};
                 return {
                     ...item,
@@ -511,7 +545,8 @@ exports.getExploreMenu = async (req, res) => {
                     vendorName: profile.name || (item.userId.firstName + "'s Kitchen"),
                     vendorAddress: profile.addr || 'Location not available',
                     deliveryPolicy: profile.deliveryPolicy,
-                    vendorLocation: profile.vendorLocation
+                    vendorLocation: profile.vendorLocation,
+                    kitchenOpen: profile.kitchenOpen
                 };
             });
         }

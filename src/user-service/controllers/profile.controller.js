@@ -1,7 +1,9 @@
+const jwt = require('jsonwebtoken');
 const Users = require('../../models/users.model');
 const UserProfile = require('../../models/userProfile.model');
 const MESSAGES = require('../../constants/messages');
 const { sendEmail, sendSmsNotification } = require('../../utils/notification.service');
+const { computeStepCompletion } = require('../../utils/vendor-steps');
 
 /**
  * Get User Profile (including Addresses)
@@ -27,13 +29,25 @@ exports.getProfile = async (req, res) => {
         // Base profile data
         const profileData = {
             id: user._id,
+            _id: user._id,
+            firstName: user.firstName,
+            lastName: user.lastName,
             firstname: user.firstName,
             lastname: user.lastName,
             email: user.email,
             mobile: user.phone,
+            phone: user.phone,
             countryCode: user.countryCode,
             activeRole: activeRole,
+            role: activeRole,
             userType: activeRole,
+
+            // Vendor capability flags — exposed so the frontend can detect
+            // a user who CAN be a vendor even when their activeRole is
+            // currently flipped to USER. The orders page uses these to
+            // decide whether to call /orders/vendor vs /orders/my.
+            isVendor: !!user.isVendor,
+            isVendorCreated: !!user.isVendor,
 
             // Addresses from UserProfile
             addresses: userProfile.deliveryAddress || [],
@@ -41,34 +55,23 @@ exports.getProfile = async (req, res) => {
         };
 
         if (activeRole === 'VENDOR') {
-            // Vendor Specific Data from UserProfile
-            profileData.vendorProfile = userProfile.toObject(); // Ensure we can add properties
+            profileData.vendorProfile = userProfile.toObject();
 
-            // Calculate Step Completion based on VendorAck and Data existence
-            const ack = userProfile.vendorAck || {};
-            profileData.vendorProfile.stepCompleted = {
-                step1: !!userProfile.businessName, // Step 1 is done if business name exists
-                step2: !!ack.payment,
-                step3: !!ack.cancellation,
-                step4: !!ack.delivery,
-                step5: !!ack.refund,
-                step6: !!ack.terms
-            };
+            // Single source of truth for step completion (handles legacy data
+            // where stepCompleted flags weren't persisted).
+            const { steps, allCompleted: allStepsCompleted } = computeStepCompletion(userProfile);
+            profileData.vendorProfile.stepCompleted = steps;
+            profileData.stepCompleted = steps;
+            profileData.allStepsCompleted = allStepsCompleted;
 
-            // Vendor Kitchen Status
-            // Simplified check: if all required steps exist in the object (Checking step6 existence often implies completion)
-            // Or use userProfile.vendorStatus
-            profileData.kitchenStatus = userProfile.vendorStatus === 'Active' ? 'OPEN' : (userProfile.vendorStatus === 'Inactive' ? 'OFFLINE' : 'PENDING');
-            profileData.isLive = userProfile.vendorStatus === 'Active';
-
-            // Map legacy address format if needed, but new frontend uses 'addresses' array properly now? 
-            // If specific "Business Address" is needed by frontend separately:
-            if (userProfile.vendorLocation && userProfile.vendorLocation.address1) {
-                // Ensure business address is visible if needed, 
-                // but usually handled by 'vendorProfile' object in new structure.
-            }
+            profileData.kitchenStatus = !allStepsCompleted ? 'PENDING'
+                : (userProfile.kitchenOpen ? 'OPEN' : 'CLOSED');
+            profileData.isLive = allStepsCompleted && userProfile.kitchenOpen;
+            profileData.kitchenOpen = userProfile.kitchenOpen || false;
+            profileData.needsOnboarding = !steps.step1;
         } else {
             profileData.isLive = false;
+            profileData.kitchenOpen = false;
         }
 
         res.status(200).json({ success: true, data: profileData });
@@ -231,30 +234,75 @@ exports.switchRole = async (req, res) => {
         const user = await Users.findById(userId);
         if (!user) return res.status(404).json({ success: false, message: MESSAGES.ERROR.USER_NOT_FOUND });
 
-        // Allow "Become Vendor" — if switching to VENDOR for the first time, upgrade the user
+        const userProfile = await UserProfile.findOne({ userId });
+        const { steps: stepCompleted, allCompleted: allStepsCompleted } = computeStepCompletion(userProfile);
+
+        // ────────────────────────────────────────────────────────────────
+        // Promotion gate: a USER becomes a VENDOR ONLY after completing
+        // step 1 of the onboarding stepper. Clicking "Become Vendor" is
+        // therefore a *request* to start onboarding — it does NOT flip
+        // their role or set isVendor. If they back out of the stepper
+        // before saving step 1 they remain a buyer with zero side effects.
+        //
+        // Once step 1 is saved, vendorProfile.controller.js#updateStep1
+        // sets user.isVendor=true + user.activeRole='VENDOR' and that is
+        // the moment they actually become a vendor. From then on this
+        // endpoint is just a view-toggle between buyer and kitchen.
+        // ────────────────────────────────────────────────────────────────
         if (targetRole === 'VENDOR' && !user.isVendor) {
-            user.isVendor = true; // Upgrade to vendor (enables vendor route access)
+            // First-time "Become Vendor" — DO NOT mutate the user record.
+            // Tell the frontend to send them to /mainstep. The existing
+            // JWT (still role:USER) is fine; they don't yet need vendor
+            // socket room access — they have no kitchen, no orders.
+            return res.status(200).json({
+                success: true,
+                message: 'Onboarding required to become a vendor',
+                // No new token — existing one stays valid as a USER token
+                data: {
+                    activeRole: user.activeRole, // unchanged
+                    isVendorCreated: false,
+                    isLive: false,
+                    needsOnboarding: true,
+                    stepCompleted,
+                    allStepsCompleted: false,
+                    kitchenOpen: false,
+                    vendorAck: userProfile ? (userProfile.vendorAck || {}) : {}
+                }
+            });
         }
 
+        // Past this point: either switching back to USER, or switching to
+        // VENDOR for someone who is already a vendor (step 1 done before).
         user.activeRole = targetRole;
         await user.save();
 
-        const userProfile = await UserProfile.findOne({ userId });
-        const stepCompleted = userProfile ? (userProfile.stepCompleted || {}) : {};
         const vendorAck = userProfile ? (userProfile.vendorAck || {}) : {};
-
-        // Check if vendor has completed at minimum step 1 (business info)
         const needsOnboarding = targetRole === 'VENDOR' && !stepCompleted.step1;
+        const kitchenOpen = userProfile ? (userProfile.kitchenOpen || false) : false;
+
+        // Issue a fresh JWT carrying the new role. The Socket.IO handshake
+        // middleware uses the JWT's `role` claim to auto-join the
+        // `vendor-${id}` private room — without re-issuing the token, a
+        // user who switches USER → VENDOR mid-session would never receive
+        // NEW_ORDER events because their socket is still in the USER room.
+        const newToken = jwt.sign(
+            { id: user._id, role: user.activeRole },
+            process.env.JWT_SECRET || 'default_jwt_secret_key_change_me',
+            { expiresIn: '30d' }
+        );
 
         res.status(200).json({
             success: true,
             message: `Switched to ${targetRole} view`,
+            token: newToken,
             data: {
                 activeRole: user.activeRole,
                 isVendorCreated: user.isVendor,
-                isLive: userProfile ? (userProfile.vendorStatus === 'Active') : false,
+                isLive: allStepsCompleted && kitchenOpen,
                 needsOnboarding,
                 stepCompleted,
+                allStepsCompleted,
+                kitchenOpen,
                 vendorAck
             }
         });

@@ -29,9 +29,16 @@ const orderSchema = new mongoose.Schema({
     },
     vendorName: { type: String },
     items: [orderItemSchema],
-    subtotal: { type: Number, required: true },
+    // Charge breakdown — kept granular so historical orders can be re-displayed
+    // exactly as the user saw them at checkout. `subtotal` is items minus
+    // discount; `totalAmount` is the grand total including all charges.
+    itemTotal: { type: Number, default: 0 },     // sum of basePrice × qty (+ addons), BEFORE discount
+    discount: { type: Number, default: 0 },
+    subtotal: { type: Number, required: true },  // itemTotal − discount
     deliveryCharge: { type: Number, default: 0 },
-    totalAmount: { type: Number, required: true },
+    platformCharge: { type: Number, default: 0 },
+    taxAmount: { type: Number, default: 0 },
+    totalAmount: { type: Number, required: true }, // grand total = subtotal + delivery + platform + tax
     orderType: {
         type: String,
         enum: ['pickup', 'delivery'],

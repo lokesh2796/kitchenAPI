@@ -14,6 +14,8 @@ const userProfileSchema = new mongoose.Schema({
         address: String
     }],
     deliveryAddress: [{
+        firstName: String,
+        lastName: String,
         address1: String,
         address2: String,
         city: String,
@@ -92,12 +94,29 @@ const userProfileSchema = new mongoose.Schema({
         terms: { type: Boolean, default: false }
     },
 
-    // Vendor Status
+    // Vendor Onboarding Step Completion Tracking
+    stepCompleted: {
+        step1: { type: Boolean, default: false },
+        step2: { type: Boolean, default: false },
+        step3: { type: Boolean, default: false },
+        step4: { type: Boolean, default: false },
+        step5: { type: Boolean, default: false },
+        step6: { type: Boolean, default: false }
+    },
+
+    // Vendor Status (Active only after ALL steps completed)
     vendorStatus: {
         type: String,
         enum: ['Active', 'Inactive'],
         default: 'Inactive'
     },
+
+    // Kitchen Open/Close toggle (vendor can temporarily close kitchen)
+    kitchenOpen: {
+        type: Boolean,
+        default: false
+    },
+
     vendorCloseDate: {
         type: Date
     }

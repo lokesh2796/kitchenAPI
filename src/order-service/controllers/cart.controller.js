@@ -1,6 +1,7 @@
 const Cart = require('../models/cart.model');
 const TodayMenu = require('../../menu-service/models/todayMenu.model');
 const PreOrderMenu = require('../../menu-service/models/preOrderMenu.model');
+const { computeCharges } = require('../../utils/order-charges');
 
 /**
  * Check if the requested quantity is available for the given menu items.
@@ -200,6 +201,10 @@ exports.getCart = async (req, res) => {
             .populate({
                 path: 'items.menuItemId',
                 select: 'menuName cuisine category coverPicture otherPictures basePrice aboutItem addOnsAvail addOns maxAddonsAllowed'
+            })
+            .populate({
+                path: 'vendorId',
+                select: 'firstName lastName'
             });
 
         if (!cart) {
@@ -242,19 +247,47 @@ exports.getCart = async (req, res) => {
             return itemObj;
         }));
 
-        const totalAmount = cart.items.reduce((sum, i) => {
-            const price = i.dealPrice ?? i.basePrice;
-            const addons = (i.Addons || []).reduce((a, x) => a + (x.price || 0), 0);
-            return sum + (price + addons) * i.qty;
-        }, 0);
+        const cartObj = cart.toObject();
+        const vendorIdStr = cartObj.vendorId?._id || cartObj.vendorId;
+
+        // Look up businessName + delivery policy + location + cancellation
+        // policies from vendor profile so the cart screen can show the same
+        // delivery charge the order will use, the vendor's pickup address
+        // when the user picks pickup, AND the vendor-specific cancellation
+        // terms in the "View Cancellation Policy" sheet.
+        const UserProfile = require('../../models/userProfile.model');
+        const vendorProfile = await UserProfile.findOne({ userId: vendorIdStr })
+            .select('businessName deliveryPolicy vendorLocation todayCancelPolicy preOrderCancelPolicy')
+            .lean();
+        const vendorName = vendorProfile?.businessName
+            || `${cartObj.vendorId?.firstName || ''} ${cartObj.vendorId?.lastName || ''}`.trim()
+            || '';
+
+        // Build the charge breakdown via the shared helper. The cart UI shows
+        // delivery as if the user picked the delivery option; if they switch
+        // to pickup at checkout the order endpoint will recompute correctly.
+        const orderType = cartObj.orderType || 'pickup';
+        const charges = computeCharges(cart.items, {
+            orderType,
+            deliveryCharge: vendorProfile?.deliveryPolicy?.deliveryCharge || 0
+        });
 
         return res.status(200).json({
             data: {
-                ...cart.toObject(),
+                ...cartObj,
+                vendorId: vendorIdStr,
+                vendorName,
+                vendorLocation: vendorProfile?.vendorLocation || null,
+                vendorCancelPolicy: {
+                    today: vendorProfile?.todayCancelPolicy || null,
+                    preOrder: vendorProfile?.preOrderCancelPolicy || null
+                },
                 items: itemsWithCategory,
                 totalItems,
-                totalAmount,
-                requiredMinDays: maxDaysLead
+                requiredMinDays: maxDaysLead,
+                // Backwards-compat: old clients still read totalAmount
+                totalAmount: charges.grandTotal,
+                charges
             }
         });
 

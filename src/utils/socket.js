@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
 const Order = require('../menu-service/models/order.model');
+const Users = require('../models/users.model');
 const { calculateDistance } = require('./order-utils');
 
 let ioInstance;
@@ -23,22 +24,38 @@ const initSocketOptions = (io) => {
         next();
     });
 
-    io.on('connection', (socket) => {
+    io.on('connection', async (socket) => {
         console.log(`[Socket.IO] New connection from ${socket.id} (Total: ${io.engine.clientsCount})`);
 
-        // Automatically join rooms based on decoded JWT
+        // Automatically join rooms based on decoded JWT.
+        // CRITICAL: Vendor-room membership is decided by the live DB record
+        // (`user.isVendor`), NOT by the JWT `role` claim. JWTs become stale
+        // when a user upgrades from buyer-only to also-vendor without
+        // re-issuing a token, and a stale `role: USER` JWT used to silently
+        // skip the `vendor-${id}` join — meaning NEW_ORDER events broadcast
+        // to that room hit an empty room and the vendor never got a heads-up.
         if (socket.decoded) {
             const userId = socket.decoded.id || socket.decoded._id;
-            const role = (socket.decoded.role || '').toUpperCase();
+            const jwtRole = (socket.decoded.role || '').toUpperCase();
 
-            // Personal Notification Room
+            // Personal Notification Room (always)
             socket.join(`user-${userId}`);
-            
-            // Vendor Notification Room
-            if (role === 'VENDOR') {
+
+            // Vendor Notification Room — check DB for the source of truth.
+            let isVendor = jwtRole === 'VENDOR';
+            try {
+                const user = await Users.findById(userId).select('isVendor activeRole').lean();
+                if (user && user.isVendor) {
+                    isVendor = true;
+                }
+            } catch (e) {
+                console.warn(`[Socket.IO] DB lookup for vendor flag failed:`, e.message);
+            }
+
+            if (isVendor) {
                 socket.join(`vendor-${userId}`);
             }
-            console.log(`[Socket.IO] Auto-joined rooms for ${socket.id}: user-${userId} ${role === 'VENDOR' ? 'vendor-' + userId : ''}`);
+            console.log(`[Socket.IO] Auto-joined rooms for ${socket.id}: user-${userId}${isVendor ? ' vendor-' + userId : ''}`);
         }
 
         socket.on('join', (room) => {

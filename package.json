@@ -6,7 +6,9 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
-    "seed": "node src/seed-templates.js"
+    "seed": "node src/seed-templates.js",
+    "seed:lookup": "node src/seed-status-lookup.js",
+    "seed:lookup:force": "node src/seed-status-lookup.js --force"
   },
   "keywords": [],
   "author": "",
