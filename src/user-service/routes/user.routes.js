@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const userController = require('../controllers/user.controller');
+const { verifyToken } = require('../../middleware/auth.middleware');
 
 /**
  * @swagger
@@ -171,5 +172,7 @@ router.put('/:userId/payment/:paymentId', userController.updatePaymentMethod);
  *         description: Payment method deleted
  */
 router.delete('/:userId/payment/:paymentId', userController.deletePaymentMethod);
+
+router.post('/fcm-token', verifyToken, userController.saveFcmToken);
 
 module.exports = router;

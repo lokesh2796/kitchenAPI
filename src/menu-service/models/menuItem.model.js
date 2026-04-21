@@ -26,4 +26,9 @@ const MenuItemSchema = new Schema({
     timestamps: true // Creates createdDate (createdAt) and modifiedDate (updatedAt)
 });
 
+// Indexes for fast lookups
+MenuItemSchema.index({ userId: 1 });
+MenuItemSchema.index({ userId: 1, cuisine: 1 });
+MenuItemSchema.index({ category: 1 });
+
 module.exports = mongoose.model('MenuItem', MenuItemSchema);

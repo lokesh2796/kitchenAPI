@@ -17,4 +17,8 @@ const PreOrderMenuSchema = new Schema({
     timestamps: true
 });
 
+// Indexes for fast lookups
+PreOrderMenuSchema.index({ userId: 1 });
+PreOrderMenuSchema.index({ menuItemId: 1 });
+
 module.exports = mongoose.model('PreOrderMenu', PreOrderMenuSchema);

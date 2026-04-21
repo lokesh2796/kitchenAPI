@@ -4,6 +4,25 @@ const Users = require('../../models/users.model');
 const Cart = require('../../order-service/models/cart.model');
 const { calculateDistance, generateOrderId, generateOTP } = require('../../utils/order-utils');
 const { publishEvent, CHANNELS, EVENTS } = require('../../utils/socket');
+const { triggerEvent, PUSHER_CHANNELS, PUSHER_EVENTS } = require('../../utils/pusher');
+const { notifyVendor, notifyUser } = require('../../utils/beams.service');
+
+const ORDER_STATUS_TITLES = {
+    confirmed:        'Order Confirmed!',
+    preparing:        'Order Being Prepared',
+    ready:            'Order Ready!',
+    out_for_delivery: 'Out for Delivery',
+    delivered:        'Order Delivered!',
+    cancelled:        'Order Cancelled',
+};
+const ORDER_STATUS_MESSAGES = {
+    confirmed:        'has been accepted.',
+    preparing:        'is being prepared.',
+    ready:            'is ready for pickup.',
+    out_for_delivery: 'is on the way!',
+    delivered:        'has been delivered.',
+    cancelled:        'has been cancelled.',
+};
 const { computeCharges } = require('../../utils/order-charges');
 
 // ── IST Date Helpers ──────────────────────────────
@@ -285,6 +304,16 @@ exports.placeOrder = async (req, res) => {
                 totalAmount: saved.totalAmount,
                 order: (populatedOrder || saved).toJSON()
             });
+            triggerEvent(PUSHER_CHANNELS.VENDOR(vendorId), PUSHER_EVENTS.NEW_ORDER, {
+                orderId: saved.orderId,
+                totalAmount: saved.totalAmount
+            });
+            await notifyVendor(
+                vendorId,
+                'New Order Received!',
+                `Order #${saved.orderId} • ₹${saved.totalAmount}`,
+                { orderId: saved.orderId, type: 'new_order' }
+            );
 
             // 2. Broadcast Stock Updates to Public
             for (const item of processedItems) {
@@ -419,9 +448,15 @@ exports.updateOrderStatus = async (req, res) => {
         const { orderId } = req.params;
         const { status, cancelReason } = req.body;
 
-        const VALID = ['placed', 'confirmed', 'preparing', 'ready', 'out_for_delivery', 'delivered', 'cancelled'];
+        const VALID = ['placed', 'confirmed', 'preparing', 'ready', 'out_for_delivery', 'delivered', 'cancelled', 'dispute', 'resolved'];
         if (!VALID.includes(status)) {
             return res.status(400).json({ message: `Invalid status. Must be one of: ${VALID.join(', ')}` });
+        }
+        if (status === 'dispute') {
+            return res.status(400).json({ message: 'Use the dispute endpoint (POST /orders/:orderId/dispute) instead.' });
+        }
+        if (status === 'resolved') {
+            return res.status(400).json({ message: 'Disputes can only be resolved through the dispute resolution flow.' });
         }
 
         const order = await Order.findById(orderId);
@@ -540,6 +575,16 @@ exports.updateOrderStatus = async (req, res) => {
             };
             // Notify Customer of Status Change
             publishEvent(CHANNELS.USER_NOTIFICATIONS(order.userId), payload);
+            triggerEvent(PUSHER_CHANNELS.USER(order.userId), PUSHER_EVENTS.STATUS_UPDATE, {
+                orderId: updated.orderId,
+                status: updated.status
+            });
+            await notifyUser(
+                order.userId.toString(),
+                ORDER_STATUS_TITLES[updated.status] || 'Order Updated',
+                `Order #${updated.orderId} ${ORDER_STATUS_MESSAGES[updated.status] || `is now ${updated.status}`}`,
+                { orderId: updated.orderId, status: updated.status, type: 'status_update' }
+            );
             // Notify Vendor to sync other active dashboard sessions
             publishEvent(CHANNELS.VENDOR_NOTIFICATIONS(order.vendorId), payload);
 

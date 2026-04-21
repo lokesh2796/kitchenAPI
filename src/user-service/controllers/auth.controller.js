@@ -478,3 +478,44 @@ exports.validateToken = async (req, res) => {
         res.status(500).json({ success: false, message: MESSAGES.ERROR.INTERNAL_SERVER_ERROR, error: error.message });
     }
 };
+
+const PROVIDER_LOGIN_TYPE = { google: 'gu', facebook: 'fu', apple: 'au' };
+
+exports.socialLogin = async (req, res) => {
+    try {
+        const { provider, idToken, email, name } = req.body;
+
+        if (!provider || !idToken || !email) {
+            return res.status(400).json({ success: false, message: 'provider, idToken, and email are required' });
+        }
+
+        const normalizedEmail = email.toLowerCase().trim();
+        let user = await Users.findOne({ email: normalizedEmail });
+
+        if (!user) {
+            const nameParts = (name || '').split(' ');
+            user = await Users.create({
+                email: normalizedEmail,
+                firstName: nameParts[0] || '',
+                lastName: nameParts.slice(1).join(' ') || '',
+                phone: `SOCIAL_${provider.toUpperCase()}_${Date.now()}`,
+                countryCode: 'SOCIAL',
+                status: 'a',
+                activeRole: 'USER',
+                loginType: PROVIDER_LOGIN_TYPE[provider] || 'su',
+                userData: { provider },
+            });
+        } else if (user.status !== 'a') {
+            user.status = 'a';
+        }
+
+        user.lastSignedIn = new Date();
+        await user.save();
+
+        const token = generateToken(user);
+        return res.json({ success: true, token, message: 'Social login successful' });
+    } catch (error) {
+        console.error('[socialLogin]', error);
+        res.status(500).json({ success: false, message: MESSAGES.ERROR.INTERNAL_SERVER_ERROR, error: error.message });
+    }
+};

@@ -70,9 +70,18 @@ const userSchema = new mongoose.Schema({
     },
     lastSignedIn: {
         type: Date
+    },
+    fcmToken: {
+        type: String,
+        default: null
     }
 }, {
     timestamps: { createdAt: 'createdDate', updatedAt: 'modifiedDate' }
 });
+
+// Indexes for fast lookups
+userSchema.index({ email: 1 }, { unique: true });
+userSchema.index({ phone: 1 }, { unique: true });
+userSchema.index({ status: 1 });
 
 module.exports = mongoose.model('Users', userSchema);

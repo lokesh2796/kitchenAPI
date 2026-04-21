@@ -125,4 +125,8 @@ const userProfileSchema = new mongoose.Schema({
     timestamps: { createdAt: 'createdDate', updatedAt: 'modifiedDate' }
 });
 
+// Indexes for fast lookups
+userProfileSchema.index({ userId: 1 }, { unique: true });
+userProfileSchema.index({ vendorStatus: 1, kitchenOpen: 1 });
+
 module.exports = mongoose.model('UserProfile', userProfileSchema);

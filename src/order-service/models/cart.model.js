@@ -49,4 +49,8 @@ const cartSchema = new mongoose.Schema({
     timestamps: { createdAt: 'createdDate', updatedAt: 'modifiedDate' }
 });
 
+// Indexes for fast lookups
+cartSchema.index({ customerId: 1 });
+cartSchema.index({ customerId: 1, vendorId: 1 });
+
 module.exports = mongoose.model('Cart', cartSchema);

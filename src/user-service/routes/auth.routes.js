@@ -149,4 +149,33 @@ router.post('/verify-otp', authController.verifyOtp);
  */
 router.get('/validate-token', authController.validateToken);
 
+/**
+ * @swagger
+ * /auth/social-login:
+ *   post:
+ *     summary: Social login (Google / Facebook / Apple)
+ *     tags: [Auth]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [provider, idToken, email]
+ *             properties:
+ *               provider:
+ *                 type: string
+ *                 enum: [google, facebook, apple]
+ *               idToken:
+ *                 type: string
+ *               email:
+ *                 type: string
+ *               name:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Login successful, returns JWT token
+ */
+router.post('/social-login', authController.socialLogin);
+
 module.exports = router;

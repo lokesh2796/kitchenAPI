@@ -23,6 +23,8 @@ const initStatusCache = async () => {
                 { name: 'out_for_delivery', value: 'od' },
                 { name: 'delivered', value: 'd' },
                 { name: 'cancelled', value: 'cx' },
+                { name: 'dispute', value: 'ds' },
+                { name: 'resolved', value: 'rs' },
                 // General Statuses
                 { name: 'inactive', value: 'i' },
                 { name: 'deleted', value: 'del' }

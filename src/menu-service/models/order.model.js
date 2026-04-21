@@ -96,6 +96,31 @@ const orderSchema = new mongoose.Schema({
     cancelReason: { type: String, default: '' },
     refundAmount: { type: Number, default: 0 },
     refundPercentage: { type: Number, default: 0 },
+
+    // ── Dispute Fields ──────────────────────────────────────
+    dispute: {
+        reason: { type: String, enum: ['wrong_item', 'incorrect_order', 'other', null], default: null },
+        description: { type: String, maxlength: 500 },
+        raisedAt: { type: Date },
+        raisedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'Users' },
+        agreedToPolicy: { type: Boolean, default: false }
+    },
+    disputeMessages: [{
+        userId: { type: mongoose.Schema.Types.ObjectId, ref: 'Users' },
+        role: { type: String, enum: ['user', 'vendor', 'admin'] },
+        message: { type: String, maxlength: 500 },
+        createdAt: { type: Date, default: Date.now }
+    }],
+    disputeRefund: {
+        offeredAmount: { type: Number },
+        offeredAt: { type: Date },
+        status: { type: String, enum: ['pending', 'accepted', 'rejected', null], default: null },
+        respondedAt: { type: Date },
+        escalatedToAdmin: { type: Boolean, default: false }
+    },
+    disputeResolvedAt: { type: Date },
+    disputeResolutionNote: { type: String },
+
     orderId: {
         type: String,
         unique: true,
@@ -110,5 +135,13 @@ const orderSchema = new mongoose.Schema({
     toJSON: { getters: true },
     toObject: { getters: true }
 });
+
+// Indexes for fast lookups and sorting
+orderSchema.index({ userId: 1, createdDate: -1 });
+orderSchema.index({ vendorId: 1, createdDate: -1 });
+orderSchema.index({ status: 1 });
+orderSchema.index({ orderId: 1 }, { unique: true });
+orderSchema.index({ vendorId: 1, status: 1 });
+orderSchema.index({ userId: 1, status: 1 });
 
 module.exports = mongoose.model('Order', orderSchema);

@@ -83,18 +83,19 @@ const initSocketOptions = (io) => {
                     // 2. Fetch data (Mirroring getVendorOrders REST API)
                     const orders = await Order.find({ vendorId })
                         .populate('userId', 'firstName lastName phone profilePicture')
-                        .sort({ createdAt: -1 });
+                        .sort({ createdAt: -1 })
+                        .limit(100)
+                        .lean();
                     
                     console.log(`[Socket.IO] Found ${orders.length} orders for vendor ${vendorId}`);
 
-                    const data = orders.map(o => {
-                        const order = o.toJSON(); // Critical to hit status string getters
-                        order.distance = calculateDistance(
+                    const data = orders.map(o => ({
+                        ...o,
+                        distance: calculateDistance(
                             o.vendorAddress?.lat, o.vendorAddress?.long,
                             o.deliveryAddress?.lat, o.deliveryAddress?.long
-                        );
-                        return order;
-                    });
+                        )
+                    }));
 
                     // 3. Dispatch data back to the REQUESTING socket directly.
                     // This avoids race conditions where the socket hasn't fully joined the room yet.
@@ -150,6 +151,11 @@ module.exports = {
     EVENTS: {
         ITEM_QTY_UPDATE: 'ITEM_QTY_UPDATE',
         ORDER_STATUS_UPDATE: 'ORDER_STATUS_UPDATE',
-        NEW_ORDER: 'NEW_ORDER'
+        NEW_ORDER: 'NEW_ORDER',
+        DISPUTE_RAISED: 'DISPUTE_RAISED',
+        DISPUTE_MESSAGE: 'DISPUTE_MESSAGE',
+        DISPUTE_REFUND_OFFERED: 'DISPUTE_REFUND_OFFERED',
+        DISPUTE_REFUND_RESPONSE: 'DISPUTE_REFUND_RESPONSE',
+        DISPUTE_RESOLVED: 'DISPUTE_RESOLVED'
     }
 };

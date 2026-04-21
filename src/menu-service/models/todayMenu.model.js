@@ -17,4 +17,9 @@ const TodayMenuSchema = new Schema({
     timestamps: true
 });
 
+// Indexes for fast lookups
+TodayMenuSchema.index({ userId: 1, menuDate: 1 });
+TodayMenuSchema.index({ menuItemId: 1 });
+TodayMenuSchema.index({ menuDate: 1 });
+
 module.exports = mongoose.model('TodayMenu', TodayMenuSchema);

@@ -195,6 +195,72 @@ const LOOKUPS = [
     { category: 'spice_level', name: 'Extra Hot', value: 'extra_hot', displayName: 'Extra Hot', sortOrder: 4 },
 
     // ──────────────────────────────────────────────────────────────
+    // CANCELLATION DURATION (for cancellation policy setup)
+    // ──────────────────────────────────────────────────────────────
+    { category: 'cancellation_duration', name: '1 Hour',   value: '1hr',  displayName: '1 Hour',   sortOrder: 1 },
+    { category: 'cancellation_duration', name: '2 Hours',  value: '2hr',  displayName: '2 Hours',  sortOrder: 2 },
+    { category: 'cancellation_duration', name: '24 Hours', value: '24hr', displayName: '24 Hours', sortOrder: 3 },
+
+    // ──────────────────────────────────────────────────────────────
+    // CANCELLATION PENALTY PERCENTAGE
+    // ──────────────────────────────────────────────────────────────
+    { category: 'penalty_percentage', name: '0%',   value: '0',   displayName: '0%',   sortOrder: 1 },
+    { category: 'penalty_percentage', name: '10%',  value: '10',  displayName: '10%',  sortOrder: 2 },
+    { category: 'penalty_percentage', name: '20%',  value: '20',  displayName: '20%',  sortOrder: 3 },
+    { category: 'penalty_percentage', name: '50%',  value: '50',  displayName: '50%',  sortOrder: 4 },
+    { category: 'penalty_percentage', name: '100%', value: '100', displayName: '100%', sortOrder: 5 },
+
+    // ──────────────────────────────────────────────────────────────
+    // DELIVERY DISTANCE
+    // ──────────────────────────────────────────────────────────────
+    { category: 'delivery_distance', name: '5 km',  value: '5km',  displayName: '5 km',  sortOrder: 1 },
+    { category: 'delivery_distance', name: '10 km', value: '10km', displayName: '10 km', sortOrder: 2 },
+    { category: 'delivery_distance', name: '15 km', value: '15km', displayName: '15 km', sortOrder: 3 },
+    { category: 'delivery_distance', name: '20 km', value: '20km', displayName: '20 km', sortOrder: 4 },
+
+    // ──────────────────────────────────────────────────────────────
+    // CARD TYPE (payment card providers)
+    // ──────────────────────────────────────────────────────────────
+    { category: 'card_type', name: 'Visa',       value: 'visa',       displayName: 'Visa',       sortOrder: 1 },
+    { category: 'card_type', name: 'MasterCard', value: 'mastercard', displayName: 'MasterCard', sortOrder: 2 },
+    { category: 'card_type', name: 'Amex',       value: 'amex',       displayName: 'Amex',       sortOrder: 3 },
+    { category: 'card_type', name: 'RuPay',      value: 'rupay',      displayName: 'RuPay',      sortOrder: 4 },
+
+    // ──────────────────────────────────────────────────────────────
+    // PREPARATION TIME (lead time for scheduling)
+    // ──────────────────────────────────────────────────────────────
+    { category: 'prep_time', name: '15 Minutes', value: '15min', displayName: '15 Minutes', sortOrder: 1 },
+    { category: 'prep_time', name: '30 Minutes', value: '30min', displayName: '30 Minutes', sortOrder: 2 },
+    { category: 'prep_time', name: '1 Hour',     value: '1hr',   displayName: '1 Hour',     sortOrder: 3 },
+    { category: 'prep_time', name: '2 Hours',    value: '2hr',   displayName: '2 Hours',    sortOrder: 4 },
+    { category: 'prep_time', name: '24 Hours',   value: '24hr',  displayName: '24 Hours',   sortOrder: 5 },
+
+    // ──────────────────────────────────────────────────────────────
+    // QUANTITY OPTIONS (for scheduling menu items)
+    // ──────────────────────────────────────────────────────────────
+    { category: 'quantity_option', name: '1',  value: '1',  displayName: '1',  sortOrder: 1 },
+    { category: 'quantity_option', name: '2',  value: '2',  displayName: '2',  sortOrder: 2 },
+    { category: 'quantity_option', name: '3',  value: '3',  displayName: '3',  sortOrder: 3 },
+    { category: 'quantity_option', name: '5',  value: '5',  displayName: '5',  sortOrder: 4 },
+    { category: 'quantity_option', name: '10', value: '10', displayName: '10', sortOrder: 5 },
+    { category: 'quantity_option', name: '15', value: '15', displayName: '15', sortOrder: 6 },
+    { category: 'quantity_option', name: '20', value: '20', displayName: '20', sortOrder: 7 },
+    { category: 'quantity_option', name: '25', value: '25', displayName: '25', sortOrder: 8 },
+    { category: 'quantity_option', name: '30', value: '30', displayName: '30', sortOrder: 9 },
+    { category: 'quantity_option', name: '40', value: '40', displayName: '40', sortOrder: 10 },
+    { category: 'quantity_option', name: '50', value: '50', displayName: '50', sortOrder: 11 },
+
+    // ──────────────────────────────────────────────────────────────
+    // DASHBOARD FOOD CATEGORY (browse/filter chips)
+    // ──────────────────────────────────────────────────────────────
+    { category: 'dashboard_category', name: 'All',       value: 'all',       displayName: 'All',       sortOrder: 1 },
+    { category: 'dashboard_category', name: 'Biryani',   value: 'biryani',   displayName: 'Biryani',   sortOrder: 2 },
+    { category: 'dashboard_category', name: 'Healthy',   value: 'healthy',   displayName: 'Healthy',   sortOrder: 3 },
+    { category: 'dashboard_category', name: 'Breakfast', value: 'breakfast', displayName: 'Breakfast', sortOrder: 4 },
+    { category: 'dashboard_category', name: 'Desserts',  value: 'desserts',  displayName: 'Desserts',  sortOrder: 5 },
+    { category: 'dashboard_category', name: 'Snacks',    value: 'snacks',    displayName: 'Snacks',    sortOrder: 6 },
+
+    // ──────────────────────────────────────────────────────────────
     // EXISTING — keep these so old data still resolves
     // ──────────────────────────────────────────────────────────────
     { category: 'misc', name: 'special price applied', value: 'spa', displayName: 'Special Price Applied', sortOrder: 1 }

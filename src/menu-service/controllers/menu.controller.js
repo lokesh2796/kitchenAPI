@@ -430,7 +430,7 @@ exports.getExploreMenu = async (req, res) => {
 
             const userIds = rawItems.map(i => i.userId._id);
             // Fetch Profile for business name, vendor location, delivery policy, kitchen status
-            const profiles = await UserProfile.find({ userId: { $in: userIds } }).select('userId businessName vendorLocation deliveryPolicy vendorStatus kitchenOpen');
+            const profiles = await UserProfile.find({ userId: { $in: userIds } }).select('userId businessName vendorLocation deliveryPolicy vendorStatus kitchenOpen').lean();
 
             const profileMap = {};
             profiles.forEach(p => {
@@ -507,8 +507,7 @@ exports.getExploreMenu = async (req, res) => {
                 }).lean();
 
             const userIds = rawItems.map(i => i.userId._id);
-            // Fetch Profile for business name, vendor location, delivery policy, kitchen status
-            const profiles = await UserProfile.find({ userId: { $in: userIds } }).select('userId businessName vendorLocation deliveryPolicy vendorStatus kitchenOpen');
+            const profiles = await UserProfile.find({ userId: { $in: userIds } }).select('userId businessName vendorLocation deliveryPolicy vendorStatus kitchenOpen').lean();
 
             const profileMap = {};
             profiles.forEach(p => {

@@ -133,4 +133,11 @@ const orderSchema = new mongoose.Schema({
     timestamps: { createdAt: 'createdDate', updatedAt: 'modifiedDate' }
 });
 
+// Indexes for fast lookups and sorting
+orderSchema.index({ customerId: 1, createdDate: -1 });
+orderSchema.index({ vendorId: 1, createdDate: -1 });
+orderSchema.index({ orderId: 1 }, { unique: true });
+orderSchema.index({ customerId: 1, 'orderStatus.name': 1 });
+orderSchema.index({ vendorId: 1, 'orderStatus.name': 1 });
+
 module.exports = mongoose.models.Order || mongoose.model('Order', orderSchema);
