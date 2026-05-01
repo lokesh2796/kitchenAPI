@@ -2,6 +2,10 @@ const jwt = require('jsonwebtoken');
 const Order = require('../menu-service/models/order.model');
 const Users = require('../models/users.model');
 const { calculateDistance } = require('./order-utils');
+const { sendToUser, sendToVendor } = require('./firebase-fcm.service');
+
+// Statuses that allow live chat
+const CHAT_ALLOWED_STATUSES = ['confirmed', 'preparing', 'ready', 'out_for_delivery'];
 
 let ioInstance;
 
@@ -64,6 +68,86 @@ const initSocketOptions = (io) => {
             console.log(`[Socket.IO] Client ${socket.id} manually joined room: ${room}`);
         });
 
+        socket.on('join-order-chat', (orderId) => {
+            if (!orderId) return;
+            socket.join(`order-chat-${orderId}`);
+            console.log(`[Socket.IO] Client ${socket.id} joined order-chat-${orderId}`);
+        });
+
+        socket.on('leave-order-chat', (orderId) => {
+            if (!orderId) return;
+            socket.leave(`order-chat-${orderId}`);
+        });
+
+        // ── Real-time chat message (WebSocket path) ──────────────
+        // Client emits SEND_CHAT_MESSAGE → server saves to DB →
+        // broadcasts CHAT_MESSAGE to both parties → acks sender.
+        socket.on('SEND_CHAT_MESSAGE', async ({ orderId, message } = {}, callback) => {
+            const ack = (typeof callback === 'function') ? callback : () => {};
+
+            try {
+                const userId = socket.decoded?.id || socket.decoded?._id;
+                if (!userId) return ack({ error: 'Unauthenticated' });
+                if (!orderId || !message?.trim()) return ack({ error: 'orderId and message are required' });
+
+                const msg = message.trim().substring(0, 500);
+
+                // Load order (without lean so status getter runs)
+                const order = await Order.findById(orderId)
+                    .select('userId vendorId status orderId chatMessages');
+                if (!order) return ack({ error: 'Order not found' });
+
+                const isCustomer = order.userId.toString() === userId.toString();
+                const isVendor   = order.vendorId.toString() === userId.toString();
+                if (!isCustomer && !isVendor) return ack({ error: 'Not authorized' });
+
+                const statusName = (typeof order.status === 'string'
+                    ? order.status
+                    : order.status?.name || '').toLowerCase();
+                if (!CHAT_ALLOWED_STATUSES.includes(statusName)) {
+                    return ack({ error: `Chat not available for status: ${statusName}` });
+                }
+
+                const senderRole = isCustomer ? 'user' : 'vendor';
+
+                // Save to DB atomically
+                const updated = await Order.findByIdAndUpdate(
+                    orderId,
+                    { $push: { chatMessages: { senderId: userId, senderRole, message: msg, read: false, createdAt: new Date() } } },
+                    { new: true }
+                ).select('chatMessages');
+
+                const savedMsg = updated.chatMessages[updated.chatMessages.length - 1];
+
+                const payload = { event: 'CHAT_MESSAGE', orderId, messageDoc: savedMsg, senderRole };
+
+                // Broadcast to everyone in the chat room (both parties if both have chat open)
+                ioInstance.to(`order-chat-${orderId}`).emit('CHAT_MESSAGE', payload);
+
+                // Also push to recipient's personal notification room (badge when chat closed)
+                const recipientId = isCustomer ? order.vendorId.toString() : order.userId.toString();
+                const recipientRoom = isCustomer ? `vendor-${recipientId}` : `user-${recipientId}`;
+                ioInstance.to(recipientRoom).emit('CHAT_MESSAGE', payload);
+
+                // FCM push for offline / background devices (fire-and-forget)
+                const title = isCustomer ? 'Message from Customer' : 'Message from Kitchen';
+                const preview = msg.substring(0, 100);
+                const fcmData = { orderId: order.orderId, type: 'chat_message' };
+                if (isCustomer) {
+                    sendToVendor(recipientId, title, preview, fcmData).catch(() => {});
+                } else {
+                    sendToUser(recipientId, title, preview, fcmData).catch(() => {});
+                }
+
+                console.log(`[Chat WS] ${senderRole} ${userId} → order ${orderId}: "${msg.substring(0, 40)}"`);
+                ack({ success: true, message: savedMsg });
+
+            } catch (err) {
+                console.error('[Chat WS] SEND_CHAT_MESSAGE error:', err.message);
+                ack({ error: err.message });
+            }
+        });
+
         // Mirroring the backend-queries PubNub zero-API functionality
         socket.on('FETCH_VENDOR_ORDERS', async (payload) => {
             console.log(`[Socket.IO] Received FETCH_VENDOR_ORDERS from ${socket.id}`);
@@ -81,16 +165,18 @@ const initSocketOptions = (io) => {
                     console.log(`[Socket.IO] Verified Vendor: ${vendorId} for socket ${socket.id}`);
 
                     // 2. Fetch data (Mirroring getVendorOrders REST API)
-                    const orders = await Order.find({ vendorId })
+                    // Do NOT use .lean() — we need the status getter to resolve
+                    // short codes ('d', 'cx', 'del') to canonical names so the
+                    // frontend receives 'delivered' / 'cancelled', not raw codes.
+                    const orderDocs = await Order.find({ vendorId })
                         .populate('userId', 'firstName lastName phone profilePicture')
-                        .sort({ createdAt: -1 })
-                        .limit(100)
-                        .lean();
-                    
-                    console.log(`[Socket.IO] Found ${orders.length} orders for vendor ${vendorId}`);
+                        .sort({ createdDate: -1 })
+                        .limit(100);
 
-                    const data = orders.map(o => ({
-                        ...o,
+                    console.log(`[Socket.IO] Found ${orderDocs.length} orders for vendor ${vendorId}`);
+
+                    const data = orderDocs.map(o => ({
+                        ...o.toObject(),
                         distance: calculateDistance(
                             o.vendorAddress?.lat, o.vendorAddress?.long,
                             o.deliveryAddress?.lat, o.deliveryAddress?.long
@@ -150,12 +236,15 @@ module.exports = {
     },
     EVENTS: {
         ITEM_QTY_UPDATE: 'ITEM_QTY_UPDATE',
+        MENU_SCHEDULE_UPDATED: 'MENU_SCHEDULE_UPDATED',
         ORDER_STATUS_UPDATE: 'ORDER_STATUS_UPDATE',
         NEW_ORDER: 'NEW_ORDER',
         DISPUTE_RAISED: 'DISPUTE_RAISED',
         DISPUTE_MESSAGE: 'DISPUTE_MESSAGE',
         DISPUTE_REFUND_OFFERED: 'DISPUTE_REFUND_OFFERED',
         DISPUTE_REFUND_RESPONSE: 'DISPUTE_REFUND_RESPONSE',
-        DISPUTE_RESOLVED: 'DISPUTE_RESOLVED'
-    }
+        DISPUTE_RESOLVED: 'DISPUTE_RESOLVED',
+        CHAT_MESSAGE: 'CHAT_MESSAGE'
+    },
+    CHAT_ROOM: (orderId) => `order-chat-${orderId}`
 };

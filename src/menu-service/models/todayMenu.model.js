@@ -13,6 +13,7 @@ const TodayMenuSchema = new Schema({
     menuDate: { type: Date, required: true }, // Only date, not time
     basePrice: { type: Number, required: true },
     dealPrice: { type: Number },
+    isHidden: { type: Boolean, default: false },
 }, {
     timestamps: true
 });

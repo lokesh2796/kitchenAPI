@@ -5,6 +5,26 @@ const cacheByName = new Map();
 const cacheByValue = new Map();
 let isInitialized = false;
 
+// Hard-coded order-status mappings that take priority over whatever the DB
+// contains. This prevents stale DB entries (e.g. an old schema where 'd' meant
+// 'deleted') from corrupting the live status resolution and showing delivered
+// orders as 'cancelled'.
+const CANONICAL_NAME_TO_VALUE = {
+    placed:           'p',
+    confirmed:        'c',
+    preparing:        'pr',
+    ready:            'r',
+    out_for_delivery: 'od',
+    delivered:        'd',
+    cancelled:        'cx',
+    disputed:         'ds',
+    resolved:         'rs',
+};
+// Reverse of the above — value → canonical name
+const CANONICAL_VALUE_TO_NAME = Object.fromEntries(
+    Object.entries(CANONICAL_NAME_TO_VALUE).map(([k, v]) => [v, k])
+);
+
 // 1. Initialize Cache on server boot
 const initStatusCache = async () => {
     try {
@@ -48,12 +68,14 @@ const initStatusCache = async () => {
 
 /**
  * Get the shorthand value from a full name.
- * Ex: getStatusValue('active') -> 'a'
+ * Ex: getStatusValue('delivered') -> 'd'
  */
 const getStatusValue = (name) => {
     if (!name) return name;
-    if (!isInitialized) console.warn('[StatusCache] Accessed before initialization!');
     const key = String(name).toLowerCase();
+    // Hard-coded order statuses always win — DB cannot override these
+    if (CANONICAL_NAME_TO_VALUE[key]) return CANONICAL_NAME_TO_VALUE[key];
+    if (!isInitialized) console.warn('[StatusCache] Accessed before initialization!');
     return cacheByName.has(key) ? cacheByName.get(key) : name;
 };
 
@@ -66,21 +88,28 @@ const legacyAliases = {
     'order placed': 'placed',
     approved: 'confirmed',
     'out for delivery': 'out_for_delivery',
-    canceled: 'cancelled'
+    canceled: 'cancelled',
+    deleted: 'cancelled'  // soft-deleted orders are treated as cancelled in UI
 };
 
 /**
  * Get the full name from a shorthand value.
- * Ex: getStatusName('a') -> 'active'
+ * Ex: getStatusName('d') -> 'delivered'
  */
 const getStatusName = (value) => {
     if (!value) return value;
-    if (!isInitialized) console.warn('[StatusCache] Accessed before initialization!');
     const key = String(value).toLowerCase();
-    if (cacheByValue.has(key)) return cacheByValue.get(key);
+    // Hard-coded order statuses always win — prevents stale DB entries (e.g.
+    // 'd' → 'deleted' from an older schema) from returning the wrong name.
+    if (CANONICAL_VALUE_TO_NAME[key]) return CANONICAL_VALUE_TO_NAME[key];
+    // Already a canonical name — no lookup needed
+    if (CANONICAL_NAME_TO_VALUE[key]) return key;
+    if (!isInitialized) console.warn('[StatusCache] Accessed before initialization!');
+    if (cacheByValue.has(key)) {
+        const name = cacheByValue.get(key);
+        return legacyAliases[name] || name;
+    }
     if (legacyAliases[key]) return legacyAliases[key];
-    // If the stored value is already a canonical name (was inserted by name
-    // rather than by code), return it as-is.
     if (cacheByName.has(key)) return key;
     return value; // Graceful DB fallback
 };

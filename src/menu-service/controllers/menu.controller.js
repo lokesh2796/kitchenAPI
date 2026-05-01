@@ -4,6 +4,44 @@ const PreOrderMenu = require('../models/preOrderMenu.model');
 const UserProfile = require('../../models/userProfile.model');
 const { publishEvent, CHANNELS, EVENTS } = require('../../utils/socket');
 
+// ── IST Time Window Helpers ───────────────────────────────────────────────────
+
+function getISTDateStr(date) {
+    return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Kolkata',
+        year: 'numeric', month: '2-digit', day: '2-digit'
+    }).format(new Date(date));
+}
+
+function getCurrentISTMinutes() {
+    const now = new Date();
+    const istDate = new Date(now.getTime() + 5.5 * 60 * 60 * 1000);
+    return istDate.getUTCHours() * 60 + istDate.getUTCMinutes();
+}
+
+// Parses "10:00 AM", "22:00", "Noon", "9:30 PM" → minutes from midnight
+function timeStrToMinutes(timeStr) {
+    if (!timeStr) return null;
+    if (timeStr === 'Noon') return 12 * 60;
+    const match = timeStr.match(/(\d+):?(\d+)?\s*(AM|PM)?/i);
+    if (!match) return null;
+    let h = parseInt(match[1]);
+    let m = parseInt(match[2] || '0');
+    const period = (match[3] || '').toUpperCase();
+    if (period === 'PM' && h !== 12) h += 12;
+    if (period === 'AM' && h === 12) h = 0;
+    return h * 60 + m;
+}
+
+// Returns true if the current IST time is within the ordering window.
+// Defaults: if availFrom is missing → 0 (start of day); if availTo is missing → 1440 (midnight = end of today).
+function isWithinOrderingWindow(availFrom, availTo) {
+    const nowMins  = getCurrentISTMinutes();
+    const fromMins = timeStrToMinutes(availFrom) ?? 0;
+    const toMins   = timeStrToMinutes(availTo)   ?? 1440; // 24:00 hard cutoff
+    return nowMins >= fromMins && nowMins < toMins;
+}
+
 // --- Master Menu Items ---
 
 exports.addMenuItem = async (req, res) => {
@@ -135,6 +173,26 @@ exports.addToTodayMenu = async (req, res) => {
         const newStart = timeToMinutes(availFrom);
         const newEnd = timeToMinutes(availTo);
 
+        // For today's date: enforce both times are in the future and end ≤ 23:59
+        const todayISTStr = getISTDateStr(new Date());
+        const menuDateISTStr = getISTDateStr(targetDate);
+        if (menuDateISTStr === todayISTStr) {
+            const nowMin = getCurrentISTMinutes();
+            if (newStart < nowMin) {
+                return res.status(400).json({ message: 'Start time must be in the future for today\'s menu' });
+            }
+            if (newEnd < nowMin) {
+                return res.status(400).json({ message: 'End time must be in the future for today\'s menu' });
+            }
+        }
+        // End time can be at most 11:59 PM (23:59 = 1439 minutes)
+        if (newEnd > 1439) {
+            return res.status(400).json({ message: 'End time cannot be past 11:59 PM' });
+        }
+        if (newEnd <= newStart) {
+            return res.status(400).json({ message: 'End time must be after start time' });
+        }
+
         // Fetch all existing entries for this item on this date
         const existingEntries = await TodayMenu.find({
             userId,
@@ -244,7 +302,38 @@ exports.updateTodayMenu = async (req, res) => {
     try {
         const { id } = req.params;
         const userId = req.user._id;
-        const { maxQty } = req.body;
+        const { maxQty, availFrom, availTo, menuDate } = req.body;
+
+        // Time validation for today's schedule
+        if (availFrom || availTo) {
+            const current = await TodayMenu.findOne({ _id: id, userId });
+            if (current) {
+                const checkFrom = availFrom || current.availFrom;
+                const checkTo = availTo || current.availTo;
+                const toMin = timeStrToMinutes(checkTo);
+                const fromMin = timeStrToMinutes(checkFrom);
+
+                const scheduleDate = menuDate ? new Date(menuDate) : current.menuDate;
+                const todayISTStr = getISTDateStr(new Date());
+                const scheduleDateISTStr = getISTDateStr(scheduleDate);
+
+                if (scheduleDateISTStr === todayISTStr) {
+                    const nowMin = getCurrentISTMinutes();
+                    if (fromMin < nowMin) {
+                        return res.status(400).json({ message: 'Start time must be in the future for today\'s menu' });
+                    }
+                    if (toMin < nowMin) {
+                        return res.status(400).json({ message: 'End time must be in the future for today\'s menu' });
+                    }
+                }
+                if (toMin > 1439) {
+                    return res.status(400).json({ message: 'End time cannot be past 11:59 PM' });
+                }
+                if (toMin <= fromMin) {
+                    return res.status(400).json({ message: 'End time must be after start time' });
+                }
+            }
+        }
 
         // If updating maxQty, we should also update balanceQty
         if (maxQty !== undefined) {
@@ -264,11 +353,19 @@ exports.updateTodayMenu = async (req, res) => {
             return res.status(404).json({ message: 'Schedule not found' });
         }
 
-        // Real-time stock broadcast via PubNub
-        await publishEvent('public-updates', {
-            event: 'ITEM_QTY_UPDATE',
+        // Broadcast qty change AND schedule timing so customers re-evaluate the window
+        await publishEvent(CHANNELS.PUBLIC_UPDATES, {
+            event: EVENTS.ITEM_QTY_UPDATE,
             dailyMenuId: updated._id.toString(),
             balanceQty: updated.balanceQty
+        });
+        await publishEvent(CHANNELS.PUBLIC_UPDATES, {
+            event: EVENTS.MENU_SCHEDULE_UPDATED,
+            dailyMenuId: updated._id.toString(),
+            availFrom: updated.availFrom,
+            availTo: updated.availTo,
+            balanceQty: updated.balanceQty,
+            menuName: updated.menuName
         });
 
         res.status(200).json({ message: 'Schedule updated successfully', data: updated });
@@ -371,10 +468,18 @@ exports.updatePreOrderMenu = async (req, res) => {
             return res.status(404).json({ message: 'Pre-order item not found' });
         }
 
-        await publishEvent('public-updates', {
-            event: 'ITEM_QTY_UPDATE',
+        await publishEvent(CHANNELS.PUBLIC_UPDATES, {
+            event: EVENTS.ITEM_QTY_UPDATE,
             dailyMenuId: updated._id.toString(),
             balanceQty: updated.balanceQty
+        });
+        await publishEvent(CHANNELS.PUBLIC_UPDATES, {
+            event: EVENTS.MENU_SCHEDULE_UPDATED,
+            dailyMenuId: updated._id.toString(),
+            availFrom: updated.availFrom,
+            availTo: updated.availTo,
+            balanceQty: updated.balanceQty,
+            menuName: updated.menuName
         });
 
         res.status(200).json({ message: 'Pre-order item updated', data: updated });
@@ -415,7 +520,8 @@ exports.getExploreMenu = async (req, res) => {
         const fetchMenuForDate = async (startDate, endDate, requireKitchenOpen = true) => {
             const filter = {
                 menuDate: { $gte: startDate, $lte: endDate },
-                balanceQty: { $gt: 0 }
+                balanceQty: { $gt: 0 },
+                isHidden: { $ne: true }
             };
 
             const rawItems = await TodayMenu.find(filter)
@@ -479,11 +585,21 @@ exports.getExploreMenu = async (req, res) => {
             const endOfToday = new Date(startOfToday);
             endOfToday.setUTCHours(23, 59, 59, 999);
 
-            // Today: requires kitchen to be currently open.
-            todayItems = (await fetchMenuForDate(startOfToday, endOfToday, true))
+            // Today: show only items whose ordering window includes the current IST time.
+            // e.g. availFrom="09:00 PM" availTo="10:00 PM" → visible only 21:00-22:00.
+            // Items with no availFrom/availTo default to the full day (0:00–24:00).
+            const allTodayItems = await fetchMenuForDate(startOfToday, endOfToday, false);
+            todayItems = allTodayItems
+                .filter(i => isWithinOrderingWindow(i.availFrom, i.availTo))
                 .map(i => ({ ...i, menuTag: 'today' }));
 
-            // Fetch Tomorrow's Items — visible regardless of kitchen-open today.
+            if (allTodayItems.length > todayItems.length) {
+                console.log(`[explore] filtered out ${allTodayItems.length - todayItems.length} today items outside current time window`);
+            }
+
+            // Tomorrow's items — same ordering-window filter as today.
+            // A vendor who schedules Breakfast (6 AM–10 AM) only wants orders
+            // placed during that window even for tomorrow's delivery.
             const startOfTomorrow = new Date(startOfToday);
             startOfTomorrow.setDate(startOfTomorrow.getDate() + 1);
             startOfTomorrow.setUTCHours(0, 0, 0, 0);
@@ -491,12 +607,14 @@ exports.getExploreMenu = async (req, res) => {
             const endOfTomorrow = new Date(startOfTomorrow);
             endOfTomorrow.setUTCHours(23, 59, 59, 999);
 
-            tomorrowItems = (await fetchMenuForDate(startOfTomorrow, endOfTomorrow, false))
-                .map(i => ({ ...i, menuTag: 'tomorrow' }));
+            const allTomorrowItems = await fetchMenuForDate(startOfTomorrow, endOfTomorrow, false);
+            // Tomorrow items: ordering is allowed at any time today — availFrom/availTo
+            // represents the delivery window on the scheduled day, not the ordering window.
+            tomorrowItems = allTomorrowItems.map(i => ({ ...i, menuTag: 'tomorrow' }));
         }
 
         if (type === 'preorder' || type === 'all') {
-            const rawItems = await PreOrderMenu.find({ balanceQty: { $gt: 0 } })
+            const rawItems = await PreOrderMenu.find({ balanceQty: { $gt: 0 }, isHidden: { $ne: true } })
                 .populate({
                     path: 'menuItemId',
                     select: 'menuName cuisine category menuItemType coverPicture otherPictures basePrice addOnsAvail addOns maxAddonsAllowed aboutItem'
@@ -525,8 +643,9 @@ exports.getExploreMenu = async (req, res) => {
                 };
             });
 
-            // Preorders are future orders — visible whenever the vendor is
-            // Active, even if their kitchen is currently closed for today.
+            // Preorders: ordering is allowed at any time — availFrom/availTo represents
+            // the vendor's preferred delivery window, not an ordering restriction.
+            // Only filter out inactive vendors.
             const filteredPre = rawItems.filter(item => {
                 const profile = profileMap[item.userId._id.toString()];
                 return profile && profile.vendorStatus === 'Active';
@@ -559,6 +678,20 @@ exports.getExploreMenu = async (req, res) => {
         });
     } catch (error) {
         console.error('CRITICAL: Error in getExploreMenu:', error);
+        res.status(500).json({ message: 'Internal Server Error', error: error.message });
+    }
+};
+
+exports.toggleMenuVisibility = async (req, res) => {
+    try {
+        const { id, menuType } = req.params; // menuType: 'today' | 'preorder'
+        const Model = menuType === 'preorder' ? PreOrderMenu : TodayMenu;
+        const item = await Model.findOne({ _id: id, userId: req.user.id });
+        if (!item) return res.status(404).json({ message: 'Menu item not found' });
+        item.isHidden = !item.isHidden;
+        await item.save();
+        res.status(200).json({ message: 'Visibility updated', isHidden: item.isHidden });
+    } catch (error) {
         res.status(500).json({ message: 'Internal Server Error', error: error.message });
     }
 };

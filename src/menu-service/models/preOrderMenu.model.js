@@ -13,6 +13,7 @@ const PreOrderMenuSchema = new Schema({
     advanceNotice: { type: String }, // e.g., "24 hours"
     basePrice: { type: Number, required: true },
     dealPrice: { type: Number },
+    isHidden: { type: Boolean, default: false },
 }, {
     timestamps: true
 });

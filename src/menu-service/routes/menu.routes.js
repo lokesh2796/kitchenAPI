@@ -86,4 +86,7 @@ router.get('/preorder', menuController.getPreOrderMenus);
 router.put('/preorder/:id', menuController.updatePreOrderMenu);
 router.delete('/preorder/:id', menuController.deletePreOrderMenu);
 
+// --- Visibility Toggle (today / preorder) ---
+router.patch('/:menuType/:id/toggle-visibility', menuController.toggleMenuVisibility);
+
 module.exports = router;

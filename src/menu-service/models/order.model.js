@@ -13,6 +13,7 @@ const orderItemSchema = new mongoose.Schema({
         name: String,
         price: Number
     }],
+    splIns: { type: String, default: '' },
     itemTotal: { type: Number, required: true }
 });
 
@@ -90,12 +91,33 @@ const orderSchema = new mongoose.Schema({
     estimatedPickupTime: { type: String },
     cancelledBy: {
         type: String,
-        enum: ['user', 'vendor', null],
+        enum: ['user', 'vendor', 'system', null],
         default: null
     },
     cancelReason: { type: String, default: '' },
     refundAmount: { type: Number, default: 0 },
     refundPercentage: { type: Number, default: 0 },
+    refundStatus: {
+        type: String,
+        enum: ['none', 'initiated', 'completed'],
+        default: 'none',
+    },
+
+    // ── Vendor Assignment / Acceptance ─────────────────────────────────────
+    // Tracks the live acceptance window.  Full history lives in OrderAssignment.
+    assignmentStatus: {
+        type: String,
+        enum: ['unassigned', 'assigned', 'accepted', 'rejected', 'timeout', 'reassigned', 'exhausted'],
+        default: 'unassigned',
+    },
+    assignedVendorId: { type: mongoose.Schema.Types.ObjectId, ref: 'Users' },
+    acceptanceDeadline: { type: Date },   // UTC — when this vendor's window expires
+    statusHistory: [{
+        status:    { type: String },
+        changedAt: { type: Date, default: Date.now },
+        changedBy: { type: String, enum: ['user', 'vendor', 'system'] },
+        note:      { type: String },
+    }],
 
     // ── Dispute Fields ──────────────────────────────────────
     dispute: {
@@ -120,6 +142,14 @@ const orderSchema = new mongoose.Schema({
     },
     disputeResolvedAt: { type: Date },
     disputeResolutionNote: { type: String },
+
+    chatMessages: [{
+        senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'Users', required: true },
+        senderRole: { type: String, enum: ['user', 'vendor'], required: true },
+        message: { type: String, maxlength: 500, required: true },
+        read: { type: Boolean, default: false },
+        createdAt: { type: Date, default: Date.now }
+    }],
 
     orderId: {
         type: String,

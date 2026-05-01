@@ -1,44 +1,64 @@
 const express = require("express");
-const { generateToken, notifyVendor, notifyUser } = require("../../utils/beams.service");
+const { sendToUser, sendToVendor } = require("../../utils/firebase-fcm.service");
+const Users = require("../../models/users.model");
 const router = express.Router();
 
-// Generate Beams auth token for a user (called by mobile app after login)
-router.post("/beams/token", async (req, res) => {
+// ── Debug: Test FCM push to a specific user by their userId ─────────────────
+// POST /pusher/test-push  { userId, role }
+// Call this from curl/Postman to verify FCM works end-to-end without an order
+router.post("/test-push", async (req, res) => {
   try {
-    const { user_id } = req.body;
-    if (!user_id) return res.status(400).json({ error: "user_id is required" });
-    const token = generateToken(user_id);
-    if (!token) return res.status(503).json({ error: "Beams not configured" });
-    res.json(token);
+    const { userId, role = "vendor" } = req.body;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    // Show what token is stored for this user
+    const user = await Users.findById(userId).select("fcmToken firstName");
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    if (!user.fcmToken) {
+      return res.status(200).json({
+        success: false,
+        message: `No fcmToken stored for user ${user.firstName} (${userId}). The mobile app has not saved an FCM token yet.`,
+      });
+    }
+
+    if (role === "vendor") {
+      await sendToVendor(userId, "🔔 Test Push!", "FCM is working for vendor ✓", {
+        type: "new_order",
+        orderId: "TEST",
+      });
+    } else {
+      await sendToUser(userId, "🔔 Test Push!", "FCM is working for user ✓", {
+        type: "status_update",
+        status: "confirmed",
+        orderId: "TEST",
+      });
+    }
+
+    res.json({
+      success: true,
+      message: `Push sent to ${user.firstName}`,
+      tokenPreview: user.fcmToken.substring(0, 30) + "...",
+    });
   } catch (error) {
-    console.error("[Beams] Token generation failed:", error);
-    res.status(500).json({ error: "Failed to generate token" });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Send push to a vendor (called internally from order controller)
-router.post("/notify/vendor/:vendorId", async (req, res) => {
+// ── Debug: Check what FCM token is stored for a user ────────────────────────
+// GET /pusher/check-token/:userId
+router.get("/check-token/:userId", async (req, res) => {
   try {
-    const { vendorId } = req.params;
-    const { title, body, data = {} } = req.body;
-    await notifyVendor(vendorId, title, body, data);
-    res.json({ success: true });
+    const user = await Users.findById(req.params.userId).select("fcmToken firstName phone");
+    if (!user) return res.status(404).json({ error: "User not found" });
+    res.json({
+      userId: req.params.userId,
+      name: user.firstName,
+      hasFcmToken: !!user.fcmToken,
+      tokenPreview: user.fcmToken ? user.fcmToken.substring(0, 40) + "..." : null,
+    });
   } catch (error) {
-    console.error("[Beams] Vendor notify failed:", error);
-    res.status(500).json({ error: "Failed to send notification" });
-  }
-});
-
-// Send push to a user (called internally from order controller)
-router.post("/notify/user/:userId", async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { title, body, data = {} } = req.body;
-    await notifyUser(userId, title, body, data);
-    res.json({ success: true });
-  } catch (error) {
-    console.error("[Beams] User notify failed:", error);
-    res.status(500).json({ error: "Failed to send notification" });
+    res.status(500).json({ error: error.message });
   }
 });
 

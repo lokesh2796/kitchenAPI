@@ -2,28 +2,17 @@ const Order = require('../models/order.model');
 const UserProfile = require('../../models/userProfile.model');
 const Users = require('../../models/users.model');
 const Cart = require('../../order-service/models/cart.model');
+const OrderAssignment = require('../../models/orderAssignment.model');
 const { calculateDistance, generateOrderId, generateOTP } = require('../../utils/order-utils');
 const { publishEvent, CHANNELS, EVENTS } = require('../../utils/socket');
 const { triggerEvent, PUSHER_CHANNELS, PUSHER_EVENTS } = require('../../utils/pusher');
-const { notifyVendor, notifyUser } = require('../../utils/beams.service');
-
-const ORDER_STATUS_TITLES = {
-    confirmed:        'Order Confirmed!',
-    preparing:        'Order Being Prepared',
-    ready:            'Order Ready!',
-    out_for_delivery: 'Out for Delivery',
-    delivered:        'Order Delivered!',
-    cancelled:        'Order Cancelled',
-};
-const ORDER_STATUS_MESSAGES = {
-    confirmed:        'has been accepted.',
-    preparing:        'is being prepared.',
-    ready:            'is ready for pickup.',
-    out_for_delivery: 'is on the way!',
-    delivered:        'has been delivered.',
-    cancelled:        'has been cancelled.',
-};
+const { sendToVendor, sendToUser } = require('../../utils/firebase-fcm.service');
 const { computeCharges } = require('../../utils/order-charges');
+const MESSAGES = require('../../constants/messages');
+const assignmentService = require('../../services/vendorAssignment.service');
+
+const ORDER_STATUS_TITLES = MESSAGES.ORDER_NOTIFICATION.STATUS_TITLES;
+const ORDER_STATUS_MESSAGES = MESSAGES.ORDER_NOTIFICATION.STATUS_MESSAGES;
 
 // ── IST Date Helpers ──────────────────────────────
 const getISTDateStr = (date) => {
@@ -137,6 +126,53 @@ exports.placeOrder = async (req, res) => {
         const TodayMenu = require('../models/todayMenu.model');
         const PreOrderMenu = require('../models/preOrderMenu.model');
 
+        // ── IST Time Helpers (inline — same logic as menu.controller) ─────
+        const getCurrentISTMinutes = () => {
+            const istDate = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+            return istDate.getUTCHours() * 60 + istDate.getUTCMinutes();
+        };
+        const timeStrToMinutes = (timeStr) => {
+            if (!timeStr) return null;
+            if (timeStr === 'Noon') return 720;
+            const match = timeStr.match(/(\d+):?(\d+)?\s*(AM|PM)?/i);
+            if (!match) return null;
+            let h = parseInt(match[1]), m = parseInt(match[2] || '0');
+            const p = (match[3] || '').toUpperCase();
+            if (p === 'PM' && h !== 12) h += 12;
+            if (p === 'AM' && h === 12) h = 0;
+            return h * 60 + m;
+        };
+
+        // ── Time Window Check for Today's items ───────────────────────────
+        // deliveryDateStr and todayStr are already computed above.
+        // Only enforce the time window for same-day orders; future orders
+        // (tomorrow/preorder) are scheduled by the customer, not live.
+        const isOrderForToday = deliveryDateStr === todayStr;
+        if (isOrderForToday) {
+            const nowMins = getCurrentISTMinutes();
+            for (const item of items) {
+                if (!item.dailyMenuId) continue;
+                const entry = await TodayMenu.findById(item.dailyMenuId).select('availFrom availTo menuName').lean();
+                if (!entry) continue; // Pre-order only item — checked elsewhere
+
+                const fromMins = timeStrToMinutes(entry.availFrom) ?? 0;
+                const toMins   = timeStrToMinutes(entry.availTo)   ?? 1440; // 24:00 hard cutoff
+
+                if (nowMins < fromMins) {
+                    const fromLabel = entry.availFrom || '12:00 AM';
+                    return res.status(400).json({
+                        message: `Orders for "${entry.menuName}" open at ${fromLabel}. Please place your order after that time.`
+                    });
+                }
+                if (nowMins >= toMins) {
+                    const toLabel = entry.availTo || 'midnight';
+                    return res.status(400).json({
+                        message: `Orders for "${entry.menuName}" closed at ${toLabel}. This item is no longer available for today.`
+                    });
+                }
+            }
+        }
+
         // Check if any item is a pre-order only item
         let containsPreorderOnly = false;
         for (const item of items) {
@@ -235,9 +271,24 @@ exports.placeOrder = async (req, res) => {
 
         // Enforce 3-day lead time for "preorder" category
         if (orderCategory === 'preorder' && diffDays < 3) {
-            return res.status(400).json({ 
-                message: 'Pre-orders require at least a 3-day advance notice (e.g., if today is 24th, delivery must be 27th or later).' 
+            return res.status(400).json({
+                message: 'Pre-orders require at least a 3-day advance notice (e.g., if today is 24th, delivery must be 27th or later).'
             });
+        }
+
+        // Enforce 30-day cap for pre-orders
+        if (orderCategory === 'preorder' && diffDays > 30) {
+            return res.status(400).json({
+                message: 'Pre-orders can only be placed up to 30 days in advance.'
+            });
+        }
+
+        // Today/tomorrow orders must not be placed for a different date
+        if (orderCategory === 'today' && delISTStr !== todayISTStr) {
+            return res.status(400).json({ message: 'Today orders must have today\'s date as the delivery date.' });
+        }
+        if (orderCategory === 'tomorrow' && delISTStr !== tomISTStr) {
+            return res.status(400).json({ message: 'Tomorrow orders must have tomorrow\'s date as the delivery date.' });
         }
 
         // Enforce 9 AM - 12 PM window for Tomorrow and Pre-orders
@@ -287,6 +338,11 @@ exports.placeOrder = async (req, res) => {
         const saved = await order.save();
         console.log('Order saved successfully ID:', saved._id);
 
+        // ── Trigger vendor acceptance flow (non-blocking) ─────────────────
+        assignmentService.initiateAssignment(saved._id).catch((err) => {
+            console.error(`[Assignment] initiateAssignment failed for ${saved.orderId}:`, err.message);
+        });
+
         // ── Clear the cart ───────────────────────────
         await Cart.findOneAndDelete({ customerId: userId });
         console.log('Cart cleared for user:', userId);
@@ -308,7 +364,7 @@ exports.placeOrder = async (req, res) => {
                 orderId: saved.orderId,
                 totalAmount: saved.totalAmount
             });
-            await notifyVendor(
+            await sendToVendor(
                 vendorId,
                 'New Order Received!',
                 `Order #${saved.orderId} • ₹${saved.totalAmount}`,
@@ -343,11 +399,7 @@ exports.placeOrder = async (req, res) => {
 
     } catch (err) {
         console.error('CRITICAL placeOrder Error:', err);
-        return res.status(500).json({ 
-            message: 'Internal server error', 
-            error: err.message,
-            stack: err.stack 
-        });
+        return res.status(500).json({ message: 'Internal server error', error: err.message });
     }
 };
 
@@ -359,7 +411,7 @@ exports.placeOrder = async (req, res) => {
 exports.getUserOrders = async (req, res) => {
     try {
         const userId = req.user._id;
-        const orders = await Order.find({ userId }).populate('vendorId', 'firstName lastName profilePicture').sort({ createdAt: -1 });
+        const orders = await Order.find({ userId }).populate('vendorId', 'firstName lastName profilePicture phone countryCode').sort({ createdDate: -1 });
 
         const todayISTStr = getISTDateStr(new Date());
         const tomDate = new Date();
@@ -404,7 +456,7 @@ exports.getUserOrders = async (req, res) => {
 exports.getVendorOrders = async (req, res) => {
     try {
         const vendorId = req.user._id;
-        const orders = await Order.find({ vendorId }).populate('userId', 'firstName lastName phone profilePicture').sort({ createdAt: -1 });
+        const orders = await Order.find({ vendorId }).populate('userId', 'firstName lastName phone profilePicture').sort({ createdDate: -1 });
         
         const todayISTStr = getISTDateStr(new Date());
         const tomDate = new Date();
@@ -446,45 +498,97 @@ exports.getVendorOrders = async (req, res) => {
 exports.updateOrderStatus = async (req, res) => {
     try {
         const { orderId } = req.params;
-        const { status, cancelReason } = req.body;
+        const { cancelReason } = req.body;
 
-        const VALID = ['placed', 'confirmed', 'preparing', 'ready', 'out_for_delivery', 'delivered', 'cancelled', 'dispute', 'resolved'];
-        if (!VALID.includes(status)) {
-            return res.status(400).json({ message: `Invalid status. Must be one of: ${VALID.join(', ')}` });
+        // req.canonicalStatus and req.order are set by orderStateMachine middleware.
+        // Fall back to raw values for routes not protected by the middleware.
+        const status = req.canonicalStatus || req.body.status;
+        const order  = req.order || await Order.findById(orderId);
+        if (!order) return res.status(404).json({ message: 'Order not found' });
+
+        const currentUserId = req.user._id.toString();
+        const isVendor  = req.actor ? req.actor === 'vendor'  : order.vendorId.toString()  === currentUserId;
+        const isCustomer = req.actor ? req.actor === 'user'   : order.userId.toString()    === currentUserId;
+
+        if (!isVendor && !isCustomer) {
+            return res.status(403).json({ message: 'Not authorized to update this order' });
         }
-        if (status === 'dispute') {
+
+        if (status === 'disputed') {
             return res.status(400).json({ message: 'Use the dispute endpoint (POST /orders/:orderId/dispute) instead.' });
         }
         if (status === 'resolved') {
             return res.status(400).json({ message: 'Disputes can only be resolved through the dispute resolution flow.' });
         }
 
-        const order = await Order.findById(orderId);
-        if (!order) return res.status(404).json({ message: 'Order not found' });
-        
-        const currentUserId = req.user._id.toString();
-        const isVendor = order.vendorId.toString() === currentUserId;
-        const isCustomer = order.userId.toString() === currentUserId;
-        
-        if (!isVendor && !isCustomer) {
-            return res.status(403).json({ message: 'Not authorized to update this order' });
-        }
+        // ── Stock Warning on Vendor Acceptance ────────────────────────────
+        // When a vendor confirms an order, check if any item has run out of stock.
+        // This handles the race condition where two orders were placed at the same time
+        // against the last available qty — both orders were placed (stock deducted atomically),
+        // but now balanceQty is 0. The vendor needs to decide if they can still fulfill it.
+        if (isVendor && status === 'confirmed' && !req.body.forceAccept) {
+            const TodayMenu = require('../models/todayMenu.model');
+            const PreOrderMenu = require('../models/preOrderMenu.model');
+            const stockWarnings = [];
 
-        // ── Delivery Date Restriction ──────────────────
-        // Vendors can only 'Accept' (confirmed) or 'Cancel' future orders.
-        // Preparing, Ready, Out for Delivery, Delivered are restricted to the actual delivery date.
-        const RESTRICTED = ['preparing', 'ready', 'out_for_delivery', 'delivered'];
-        if (isVendor && RESTRICTED.includes(status)) {
-            const now = new Date();
-            const istOffset = 5.5 * 60 * 60 * 1000;
-            const istToday = new Date(now.getTime() + istOffset).toISOString().split('T')[0];
-            const istDelivery = new Date(order.deliveryDate.getTime() + istOffset).toISOString().split('T')[0];
+            for (const item of order.items) {
+                if (!item.dailyMenuId) continue;
+                const entry =
+                    await TodayMenu.findById(item.dailyMenuId).select('balanceQty maxQty') ||
+                    await PreOrderMenu.findById(item.dailyMenuId).select('balanceQty maxQty');
 
-            if (istToday !== istDelivery) {
-                return res.status(403).json({ 
-                    message: `Status '${status}' is only allowed on the delivery date (${istDelivery}).` 
+                if (entry && entry.balanceQty === 0) {
+                    stockWarnings.push({
+                        menuItemId: item.menuItemId,
+                        menuName: item.menuName,
+                        orderedQty: item.qty,
+                        balanceQty: 0,
+                    });
+                }
+            }
+
+            if (stockWarnings.length > 0) {
+                return res.status(409).json({
+                    requiresConfirmation: true,
+                    message: 'Some items in this order have sold out. Do you still want to accept?',
+                    stockWarnings,
+                    hint: 'Re-send this request with forceAccept: true to confirm anyway.',
                 });
             }
+        }
+
+
+        // ── Scheduled-order time lock ─────────────────────────────────────────
+        // For tomorrow / pre-orders the vendor may accept at any time, but
+        // preparing actions are locked until the scheduled date+time.
+        // 'delivered' is excluded: once food is out for delivery / in the vendor's
+        // hands the time lock has already been satisfied by an earlier transition.
+        if (isVendor && !['confirmed', 'cancelled', 'delivered'].includes(status)) {
+            const cat = order.category;
+            if (cat === 'tomorrow' || cat === 'preorder') {
+                const ptime = order.preferredTime || order.estimatedPickupTime || '00:00';
+                const match = ptime.match(/(\d+):?(\d+)?\s*(AM|PM)?/i);
+                if (match) {
+                    let h = parseInt(match[1]), m = parseInt(match[2] || '0');
+                    const pm = (match[3] || '').toUpperCase() === 'PM';
+                    if (pm && h < 12) h += 12;
+                    if (!pm && h === 12) h = 0;
+                    const scheduledTime = new Date(order.deliveryDate);
+                    scheduledTime.setHours(h, m, 0, 0);
+                    if (new Date() < scheduledTime) {
+                        const dateLabel = scheduledTime.toLocaleDateString('en-IN', { month: 'short', day: 'numeric' });
+                        return res.status(403).json({
+                            message: `This order can only be prepared from ${ptime} on ${dateLabel}.`,
+                            lockedUntil: scheduledTime.toISOString()
+                        });
+                    }
+                }
+            }
+        }
+
+        // Guard: already-delivered order must not be re-delivered (idempotency)
+        if (status === 'delivered' && order.status === 'delivered') {
+            return res.status(409).json({ message: 'Order has already been marked as delivered.' });
         }
 
         // Restore stock if order is rejected/cancelled
@@ -508,54 +612,25 @@ exports.updateOrderStatus = async (req, res) => {
                 );
             }
             
-            // Calculate Refund
-            if (order.paymentMethod !== 'COD') {
-                if (isVendor) {
-                    order.refundAmount = order.totalAmount; // 100% refund for vendor cancel
-                    order.refundPercentage = 100;
-                } else if (isCustomer) {
-                    // Calculate time difference
-                    const now = new Date();
-                    let deliveryTime = new Date(order.deliveryDate);
-                    
-                    // If preferredTime is set, parse it and set hours/mins
-                    if (order.preferredTime) {
-                        let hours = 0;
-                        let mins = 0;
-                        const timeMatch = order.preferredTime.match(/(\d+):?(\d+)?\s*(AM|PM)?/i);
-                        if (timeMatch) {
-                            hours = parseInt(timeMatch[1]);
-                            mins = parseInt(timeMatch[2] || '0');
-                            const isPM = timeMatch[3]?.toUpperCase() === 'PM';
-                            if (isPM && hours < 12) hours += 12;
-                            if (!isPM && hours === 12) hours = 0;
-                            deliveryTime.setHours(hours, mins, 0, 0);
-                        }
-                    } else {
-                        // Default to end of day if no time specified
-                        deliveryTime.setHours(23, 59, 59, 999);
-                    }
-                    
-                    const diffMs = deliveryTime.getTime() - now.getTime();
-                    const diffHours = diffMs / (1000 * 60 * 60);
-                    
-                    if (diffHours >= 12) {
-                        order.refundAmount = order.totalAmount * 0.50;
-                        order.refundPercentage = 50;
-                    } else {
-                        // Less than 12 hours (or even if time already passed, min refund is 40% as per user request)
-                        // User said: "before 12 hours 50%, after 12 hours 40%"
-                        order.refundAmount = order.totalAmount * 0.40;
-                        order.refundPercentage = 40;
-                    }
-                }
-                
-                order.paymentStatus = 'refund_processed';
-            }
         }
 
         order.status = status;
+        if (!order.statusHistory) order.statusHistory = [];
+        order.statusHistory.push({
+            status,
+            changedBy: isVendor ? 'vendor' : 'user',
+            note: status === 'cancelled' ? (cancelReason || '') : undefined,
+            changedAt: new Date(),
+        });
         const updated = await order.save();
+
+        // Kill the pending acceptance timeout job when the vendor advances the order.
+        // Not needed for 'delivered' — by that point the acceptance window was
+        // resolved long ago (at 'confirmed' or via /accept). Skipping avoids a
+        // redundant DB read and keeps the intent clear.
+        if (isVendor && status !== 'delivered') {
+            assignmentService.cancelAcceptanceJob(order._id).catch(() => {});
+        }
 
         // ── Real-time Notification ───────────────────
         try {
@@ -569,8 +644,6 @@ exports.updateOrderStatus = async (req, res) => {
                 _id: updated._id,
                 orderId: updated.orderId,
                 status: updated.status,
-                refundAmount: updated.refundAmount,
-                refundPercentage: updated.refundPercentage,
                 order: (broadcastOrder || updated).toJSON()
             };
             // Notify Customer of Status Change
@@ -579,7 +652,7 @@ exports.updateOrderStatus = async (req, res) => {
                 orderId: updated.orderId,
                 status: updated.status
             });
-            await notifyUser(
+            await sendToUser(
                 order.userId.toString(),
                 ORDER_STATUS_TITLES[updated.status] || 'Order Updated',
                 `Order #${updated.orderId} ${ORDER_STATUS_MESSAGES[updated.status] || `is now ${updated.status}`}`,
@@ -613,6 +686,242 @@ exports.updateOrderStatus = async (req, res) => {
 
     } catch (err) {
         console.error('updateOrderStatus Error:', err);
+        return res.status(500).json({ message: 'Internal server error', error: err.message });
+    }
+};
+
+const CHAT_ALLOWED_STATUSES = ['confirmed', 'preparing', 'ready', 'out_for_delivery', 'delivered'];
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   GET /orders/:orderId/chat
+   Returns chat messages for an order. Marks messages from the other side read.
+───────────────────────────────────────────────────────────────────────────── */
+exports.getChatMessages = async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const userId = req.user._id.toString();
+
+        const order = await Order.findById(orderId).select('userId vendorId status chatMessages orderId');
+        if (!order) return res.status(404).json({ message: 'Order not found' });
+
+        const isCustomer = order.userId.toString() === userId;
+        const isVendor   = order.vendorId.toString() === userId;
+        if (!isCustomer && !isVendor) {
+            return res.status(403).json({ message: 'Not authorized' });
+        }
+
+        if (!CHAT_ALLOWED_STATUSES.includes(order.status)) {
+            return res.status(403).json({ message: 'Chat is available only after the order is confirmed.' });
+        }
+
+        // Mark messages from the OTHER party as read
+        const myRole = isCustomer ? 'user' : 'vendor';
+        await Order.updateOne(
+            { _id: orderId },
+            { $set: { 'chatMessages.$[msg].read': true } },
+            { arrayFilters: [{ 'msg.senderRole': { $ne: myRole }, 'msg.read': false }] }
+        );
+
+        return res.status(200).json({ data: order.chatMessages });
+    } catch (err) {
+        console.error('getChatMessages Error:', err);
+        return res.status(500).json({ message: 'Internal server error', error: err.message });
+    }
+};
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   POST /orders/:orderId/chat
+   Send a new chat message. Broadcasts via socket + FCM to recipient.
+───────────────────────────────────────────────────────────────────────────── */
+exports.sendChatMessage = async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const { message } = req.body;
+        const userId = req.user._id.toString();
+
+        if (!message?.trim()) {
+            return res.status(400).json({ message: 'Message cannot be empty' });
+        }
+        if (message.trim().length > 500) {
+            return res.status(400).json({ message: 'Message too long (max 500 characters)' });
+        }
+
+        const order = await Order.findById(orderId);
+        if (!order) return res.status(404).json({ message: 'Order not found' });
+
+        const isCustomer = order.userId.toString() === userId;
+        const isVendor   = order.vendorId.toString() === userId;
+        if (!isCustomer && !isVendor) {
+            return res.status(403).json({ message: 'Not authorized' });
+        }
+
+        if (!CHAT_ALLOWED_STATUSES.includes(order.status)) {
+            return res.status(403).json({ message: 'Chat is available only after the order is confirmed.' });
+        }
+
+        const senderRole = isCustomer ? 'user' : 'vendor';
+        order.chatMessages.push({
+            senderId: userId,
+            senderRole,
+            message: message.trim(),
+            read: false,
+            createdAt: new Date()
+        });
+        await order.save();
+
+        const savedMsg = order.chatMessages[order.chatMessages.length - 1];
+
+        // ── Real-time: broadcast to order-chat room ───────────────────────
+        try {
+            const { CHAT_ROOM } = require('../../../utils/socket');
+            publishEvent(CHAT_ROOM(orderId), {
+                event: EVENTS.CHAT_MESSAGE,
+                orderId,
+                messageDoc: savedMsg,
+                senderRole
+            });
+
+            // Also notify the recipient's personal room (for badge update when chat isn't open)
+            const recipientRoom = isCustomer
+                ? CHANNELS.VENDOR_NOTIFICATIONS(order.vendorId)
+                : CHANNELS.USER_NOTIFICATIONS(order.userId);
+            publishEvent(recipientRoom, {
+                event: EVENTS.CHAT_MESSAGE,
+                orderId,
+                messageDoc: savedMsg,
+                senderRole
+            });
+        } catch (pbErr) {
+            console.error('Chat Socket Error:', pbErr);
+        }
+
+        // ── FCM push to recipient ────────────────────────────────────────
+        try {
+            const recipientId = isCustomer ? order.vendorId.toString() : order.userId.toString();
+            const title = isCustomer ? 'Message from Customer' : 'Message from Kitchen';
+            if (isCustomer) {
+                await sendToVendor(recipientId, title, message.trim().substring(0, 100), {
+                    orderId: order.orderId, type: 'chat_message'
+                });
+            } else {
+                await sendToUser(recipientId, title, message.trim().substring(0, 100), {
+                    orderId: order.orderId, type: 'chat_message'
+                });
+            }
+        } catch (fcmErr) {
+            console.error('Chat FCM Error:', fcmErr);
+        }
+
+        return res.status(200).json({ data: savedMsg });
+    } catch (err) {
+        console.error('sendChatMessage Error:', err);
+        return res.status(500).json({ message: 'Internal server error', error: err.message });
+    }
+};
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   GET /orders/:orderId/chat/unread
+   Returns the unread message count for the calling user.
+───────────────────────────────────────────────────────────────────────────── */
+exports.getChatUnreadCount = async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const userId = req.user._id.toString();
+
+        const order = await Order.findById(orderId).select('userId vendorId chatMessages status');
+        if (!order) return res.status(404).json({ message: 'Order not found' });
+
+        const isCustomer = order.userId.toString() === userId;
+        const isVendor   = order.vendorId.toString() === userId;
+        if (!isCustomer && !isVendor) {
+            return res.status(403).json({ message: 'Not authorized' });
+        }
+
+        const myRole = isCustomer ? 'user' : 'vendor';
+        const unread = order.chatMessages.filter(m => m.senderRole !== myRole && !m.read).length;
+
+        return res.status(200).json({ data: { unread } });
+    } catch (err) {
+        return res.status(500).json({ message: 'Internal server error', error: err.message });
+    }
+};
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   POST /orders/:orderId/accept
+   Vendor confirms they will fulfil this order.
+   Must be called within the acceptance window (120 s for TODAY, 60 s otherwise).
+───────────────────────────────────────────────────────────────────────────── */
+exports.acceptOrder = async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const vendorId    = req.user._id;
+
+        await assignmentService.vendorAccept(orderId, vendorId);
+
+        return res.status(200).json({ message: 'Order accepted successfully.' });
+    } catch (err) {
+        const code = err.statusCode || 500;
+        return res.status(code).json({ message: err.message });
+    }
+};
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   POST /orders/:orderId/reject
+   Vendor declines this order. Triggers immediate reassignment.
+   Body (optional): { reason: String }
+───────────────────────────────────────────────────────────────────────────── */
+exports.rejectOrder = async (req, res) => {
+    try {
+        const { orderId } = req.params;
+        const vendorId    = req.user._id;
+        const { reason }  = req.body;
+
+        await assignmentService.vendorReject(orderId, vendorId, reason || '');
+
+        // Return immediately — user will be notified only when a new vendor accepts or order is cancelled.
+        return res.status(200).json({ message: 'Order rejected. Reassigning to next available vendor.' });
+    } catch (err) {
+        const code = err.statusCode || 500;
+        return res.status(code).json({ message: err.message });
+    }
+};
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   GET /orders/:orderId/assignment
+   Returns assignment status for this order — used by vendor dashboard
+   to show the live acceptance countdown.
+───────────────────────────────────────────────────────────────────────────── */
+exports.getAssignmentStatus = async (req, res) => {
+    try {
+        const { orderId } = req.params;
+
+        const assignment = await OrderAssignment.findOne({ orderId })
+            .select('currentVendorId retryCount maxRetries finalStatus attempts')
+            .lean();
+
+        if (!assignment) {
+            return res.status(404).json({ message: 'Assignment record not found' });
+        }
+
+        const lastAttempt = assignment.attempts[assignment.attempts.length - 1] || null;
+        const remainingSecs = lastAttempt
+            ? Math.max(0, Math.round((new Date(lastAttempt.timeoutAt) - Date.now()) / 1000))
+            : 0;
+
+        return res.status(200).json({
+            data: {
+                finalStatus:      assignment.finalStatus,
+                currentVendorId:  assignment.currentVendorId,
+                retryCount:       assignment.retryCount,
+                maxRetries:       assignment.maxRetries,
+                remainingSecs,
+                timeoutAt:        lastAttempt?.timeoutAt,
+            },
+        });
+    } catch (err) {
         return res.status(500).json({ message: 'Internal server error', error: err.message });
     }
 };

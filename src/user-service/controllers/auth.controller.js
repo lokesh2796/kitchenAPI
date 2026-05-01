@@ -1,10 +1,75 @@
 const jwt = require('jsonwebtoken');
+const https = require('https');
+const crypto = require('crypto');
 const Users = require('../../models/users.model');
 const UserProfile = require('../../models/userProfile.model');
 const { sendEmail, sendSmsNotification } = require('../../utils/notification.service');
 const { encrypt } = require('../../utils/encryption');
 const MESSAGES = require('../../constants/messages');
 const { computeStepCompletion } = require('../../utils/vendor-steps');
+
+// ── Social Provider Token Verification ───────────────────────────────────────
+
+function httpsGet(url) {
+    return new Promise((resolve, reject) => {
+        https.get(url, (res) => {
+            let data = '';
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+                try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+                catch (e) { reject(new Error('Failed to parse response')); }
+            });
+        }).on('error', reject);
+    });
+}
+
+async function verifyGoogleToken(idToken) {
+    const { status, body } = await httpsGet(
+        `https://oauth2.googleapis.com/tokeninfo?id_token=${idToken}`
+    );
+    if (status !== 200 || body.error) {
+        throw new Error(body.error_description || 'Invalid Google token');
+    }
+    return { email: body.email, name: body.name || `${body.given_name || ''} ${body.family_name || ''}`.trim(), sub: body.sub };
+}
+
+async function verifyFacebookToken(accessToken) {
+    const { status, body } = await httpsGet(
+        `https://graph.facebook.com/me?access_token=${accessToken}&fields=id,name,email`
+    );
+    if (status !== 200 || body.error) {
+        throw new Error(body.error?.message || 'Invalid Facebook token');
+    }
+    return { email: body.email, name: body.name, sub: body.id };
+}
+
+// Cache Apple's public keys for 1 hour to avoid fetching on every request
+let appleKeysCache = { keys: null, fetchedAt: 0 };
+
+async function verifyAppleToken(idToken) {
+    const decoded = jwt.decode(idToken, { complete: true });
+    if (!decoded) throw new Error('Invalid Apple token format');
+    const { kid } = decoded.header;
+
+    // Refresh JWKS if cache is stale (> 1 hour)
+    if (!appleKeysCache.keys || Date.now() - appleKeysCache.fetchedAt > 3600000) {
+        const { body } = await httpsGet('https://appleid.apple.com/auth/keys');
+        appleKeysCache = { keys: body.keys, fetchedAt: Date.now() };
+    }
+
+    const jwk = appleKeysCache.keys.find(k => k.kid === kid);
+    if (!jwk) throw new Error('Apple signing key not found');
+
+    // Node 15+ can import JWK directly via crypto
+    const publicKey = crypto.createPublicKey({ key: jwk, format: 'jwk' });
+    const payload = jwt.verify(idToken, publicKey, {
+        algorithms: ['RS256'],
+        issuer: 'https://appleid.apple.com',
+    });
+
+    // Apple may not always return email (e.g. after first sign-in, it relays via private relay)
+    return { email: payload.email, name: null, sub: payload.sub };
+}
 
 // Generate random 6-digit OTP
 const generateOTP = () => {
@@ -483,17 +548,39 @@ const PROVIDER_LOGIN_TYPE = { google: 'gu', facebook: 'fu', apple: 'au' };
 
 exports.socialLogin = async (req, res) => {
     try {
-        const { provider, idToken, email, name } = req.body;
+        const { provider, idToken, email: clientEmail, name: clientName } = req.body;
 
-        if (!provider || !idToken || !email) {
-            return res.status(400).json({ success: false, message: 'provider, idToken, and email are required' });
+        if (!provider || !idToken) {
+            return res.status(400).json({ success: false, message: 'provider and idToken are required' });
+        }
+        if (!['google', 'facebook', 'apple'].includes(provider)) {
+            return res.status(400).json({ success: false, message: 'provider must be google, facebook, or apple' });
         }
 
-        const normalizedEmail = email.toLowerCase().trim();
+        // ── Verify token with the actual provider ──────────────────────────
+        let verifiedEmail, verifiedName;
+        try {
+            let verified;
+            if (provider === 'google')   verified = await verifyGoogleToken(idToken);
+            else if (provider === 'facebook') verified = await verifyFacebookToken(idToken);
+            else                          verified = await verifyAppleToken(idToken);
+
+            verifiedEmail = verified.email || clientEmail;
+            verifiedName  = verified.name  || clientName;
+        } catch (verifyErr) {
+            console.error(`[socialLogin] ${provider} token verification failed:`, verifyErr.message);
+            return res.status(401).json({ success: false, message: `${provider} authentication failed: ${verifyErr.message}` });
+        }
+
+        if (!verifiedEmail) {
+            return res.status(400).json({ success: false, message: 'Could not retrieve email from social provider. Please grant email permission.' });
+        }
+
+        const normalizedEmail = verifiedEmail.toLowerCase().trim();
         let user = await Users.findOne({ email: normalizedEmail });
 
         if (!user) {
-            const nameParts = (name || '').split(' ');
+            const nameParts = (verifiedName || '').split(' ');
             user = await Users.create({
                 email: normalizedEmail,
                 firstName: nameParts[0] || '',
@@ -503,17 +590,34 @@ exports.socialLogin = async (req, res) => {
                 status: 'a',
                 activeRole: 'USER',
                 loginType: PROVIDER_LOGIN_TYPE[provider] || 'su',
-                userData: { provider },
+                userData: { provider, verifiedAt: new Date() },
             });
-        } else if (user.status !== 'a') {
-            user.status = 'a';
+
+            // Create linked profile
+            await UserProfile.create({ userId: user._id });
+        } else {
+            if (user.status !== 'a') user.status = 'a';
+            // Update loginType if this is a new provider for an existing account
+            user.loginType = PROVIDER_LOGIN_TYPE[provider] || user.loginType;
         }
 
+        if (user.isVendor) user.activeRole = 'VENDOR';
         user.lastSignedIn = new Date();
         await user.save();
 
         const token = generateToken(user);
-        return res.json({ success: true, token, message: 'Social login successful' });
+        const userProfile = await UserProfile.findOne({ userId: user._id });
+
+        const responseData = {
+            email: user.email,
+            role: user.activeRole || 'USER',
+            activeRole: user.activeRole || 'USER',
+            isVerified: true,
+            isVendorCreated: user.isVendor,
+            addresses: userProfile?.deliveryAddress || [],
+        };
+
+        return res.json({ success: true, token, message: 'Social login successful', data: responseData });
     } catch (error) {
         console.error('[socialLogin]', error);
         res.status(500).json({ success: false, message: MESSAGES.ERROR.INTERNAL_SERVER_ERROR, error: error.message });
